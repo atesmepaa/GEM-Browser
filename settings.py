@@ -48,6 +48,31 @@ class BrowserSettings:
             #   True               -> hiç sorulmadan sekmeler otomatik
             #                         olarak geri yüklenir.
             "auto_restore_tabs": False,
+            # Arka plan sekmelerinin kaç dakika hareketsizlikte sonra RAM
+            # için uyutulacağı. 0 = asla uyutma. Düşük RAM modu bu süreyi
+            # yarıya indirir (4 dk -> 2 dk, eski davranışla uyumlu).
+            "tab_suspend_minutes": 4.0,
+            # Aynı anda canlı (uyumamış) sekme sayısı sınırı. Sınır aşılırsa
+            # en eski arka plan sekmesi anında uyutulur. 0 = sınırsız.
+            "max_live_tabs": 0,
+            # Kapanışta çerezler + web önbelleğini otomatik temizle
+            # (Tarama Verilerini Temizle penceresinden ayarlanır).
+            "clear_data_on_exit": False,
+            # True: şifre kasası oturum boyunca açık kalır (10 dk otomatik
+            # kilitleme yok); tarayıcı kapatılınca iner. Ayarlar'dan açılır.
+            "vault_session_unlock": False,
+            # Pencere durumu hatırlaması: kapatırken x/y/w/h ve maksimize
+            # bayrağı kaydedilir; açılışta geri yüklenir. x/y = -1 → WM'e bırak.
+            "win_x": -1,
+            "win_y": -1,
+            "win_w": 1024,
+            "win_h": 768,
+            "win_maximized": False,
+            # Arama motoru: "brave" (varsayılan) | "duckduckgo" |
+            # "startpage" | "google" | "custom". "custom" seçiliyken
+            # custom_search_url kullanılır (bkz. router.build_search_url).
+            "search_engine": "brave",
+            "custom_search_url": "",
             "vpn_enabled": False,
             # Boş string = otomatik mod: "vpn_enabled" açıldığında sistemde
             # kurulu Tor ağına otomatik bağlanılır (bkz. gem_browser/tor_vpn.py
@@ -73,6 +98,13 @@ class BrowserSettings:
         return self.default_settings.copy()
 
     def save(self):
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.current, f, indent=4)
-        secure_chmod(SETTINGS_FILE)
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.current, f, indent=4)
+            secure_chmod(SETTINGS_FILE)
+        except OSError:
+            # Disk dolu/izin hatasında ayarlar kaydedilemeyebilir; çağıran
+            # tarafın (window.py) akışı bunu beklemez — çökmek yerine sessiz
+            # geç. Kaydedilemeyen ayarlar bir sonraki açılışta eski haline
+            # döner; bu, kullanıcıyı çökertmekten iyidir.
+            pass

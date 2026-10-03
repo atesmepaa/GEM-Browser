@@ -30,12 +30,18 @@ class AdblockInterceptor(QWebEngineUrlRequestInterceptor):
         "hotjar.com", "mixpanel.com", "segment.io", "amplitude.com",
         "connect.facebook.net", "adsafeprotected.com", "doubleverify.com",
         "moatads.com", "adjust.com", "appsflyer.com", "branch.io",
-        "taboola.com", "yieldmo.com", "casalemedia.com", "sovrn.com",
+        "yieldmo.com", "casalemedia.com", "sovrn.com",
     }
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.block_domains = set(self.FALLBACK_DOMAINS)
+        # Interceptor HER ZAMAN takılı kalır (window.py); reklam engelleme
+        # kapalıyken yalnızca bu bayrak kapatılır.
+        self.enabled = True
+
+    def set_enabled(self, enabled: bool):
+        self.enabled = bool(enabled)
 
     def set_domains(self, domains) -> None:
         """
@@ -65,6 +71,8 @@ class AdblockInterceptor(QWebEngineUrlRequestInterceptor):
         return False
 
     def interceptRequest(self, info):
+        if not self.enabled:
+            return
         host = self._extract_host(info.requestUrl().toString())
         if not host:
             return

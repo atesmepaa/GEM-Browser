@@ -35,14 +35,65 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QColor
 
 from gem_browser import icons as gem_icons
+from gem_browser import theme as gem_theme
 
 MAX_LOCAL_SUGGESTIONS = 4
 MAX_REMOTE_SUGGESTIONS = 4
 DEBOUNCE_MS = 150
-# Brave Search'ün herkese açık, anahtarsız öneri uç noktası. Firefox/Opera/
-# Vivaldi gibi tarayıcılar da Brave'i arama motoru olarak eklerken bu aynı
-# "suggest_url"ü kullanıyor (search.brave.com'un kendi OpenSearch tanımı).
-SUGGEST_ENDPOINT = "https://search.brave.com/api/suggest?q="
+# Arama motoru anahtarsız/herkese açık öneri uç noktaları. Brave'in
+# "suggest" uç noktası standart OpenSearch autocomplete biçimini döndürür
+# (["sorgu", ["öneri1", ...]]); DuckDuckGo'nun /ac/ uç noktası ise ya düz
+# string listesi ya da {"phrase": ...} nesne listesi döndürür — ikisi de
+# ayrıştırılır (bkz. _extract_suggestions). Anahtar burada yoksa (google/
+# startpage/custom) uzak öneri YAPILMAZ: sorguyu başka motora sızdırmamak
+# için öneri yalnızca seçili motorun kendi uç noktasından gelir.
+_SUGGEST_ENDPOINTS = {
+    "brave": "https://search.brave.com/api/suggest?q=",
+    "duckduckgo": "https://duckduckgo.com/ac/?q=",
+}
+
+
+def suggest_url_for(engine: str) -> str:
+    """Motor için öneri uç noktası; desteklenmiyorsa boş string."""
+    return _SUGGEST_ENDPOINTS.get(engine, "")
+
+
+def _extract_suggestions(data) -> list:
+    """Her iki biçimi de ayrıştırıp düz string listesi döndürür."""
+    if not isinstance(data, list):
+        return []
+    if len(data) >= 2 and isinstance(data[0], str) and isinstance(data[1], list):
+        return [s for s in data[1] if isinstance(s, str) and s]
+    out = []
+    for s in data:
+        if isinstance(s, str) and s:
+            out.append(s)
+        elif isinstance(s, dict) and isinstance(s.get("phrase"), str) and s["phrase"]:
+            out.append(s["phrase"])
+    return out
+
+
+def _popup_colors(theme: str, accent: str = None) -> dict:
+    """Popup renk paleti. Vurguya bağlı renkler (seçili satır bandı,
+    birincil satır tint'i, satır ikonları) kullanıcının Ayarlar'dan
+    seçtiği vurgu renginden TÜRETİLİR — accent verilmezse temanın
+    varsayılanına düşer."""
+    accent = accent or gem_theme.default_accent_for_theme(theme)
+    if theme == "light":
+        return {
+            "bg": "#ffffff", "border": "rgba(0, 0, 0, 0.08)", "text": "#1a1a1a",
+            "muted": "#707070", "hover": "rgba(0, 0, 0, 0.05)",
+            "sel": gem_theme.to_rgba(accent, 0.14),
+            "sel_strong": gem_theme.to_rgba(accent, 0.24),
+            "accent": accent,
+        }
+    return {
+        "bg": "#242424", "border": "rgba(255, 255, 255, 0.08)", "text": "#ffffff",
+        "muted": "#909090", "hover": "rgba(255, 255, 255, 0.06)",
+        "sel": gem_theme.to_rgba(accent, 0.20),
+        "sel_strong": gem_theme.to_rgba(accent, 0.40),
+        "accent": accent,
+    }
 
 
 # ---------------------------------------------------------------- yerel ----
@@ -86,66 +137,91 @@ def gather_local_suggestions(text: str, bookmarks: list, history: list) -> list:
 
 class RemoteSuggester(QObject):
     """
-    DuckDuckGo autocomplete uç noktasından öneri çeker. Her yeni `request()`
-    çağrısı önceki debounce/isteği iptal eder — böylece yalnızca en son
-    yazılan metnin sonucu işlenir, geç gelen eski cevaplar güncel metnin
-    üzerine yazmaz.
+    Seçili arama motorunun öneri uç noktasından öneri çeker. Her yeni
+    `request()` çağrısı önceki debounce/isteği iptal eder — böylece yalnızca
+    en son yazılan metnin sonucu işlenir, geç gelen eski cevaplar güncel
+    metnin üzerine yazmaz. Motor Ayarlar'dan değiştirilince `set_engine()`
+    ile uç nokta da değişir; önerisi desteklenmeyen motorlarda (google/
+    startpage/custom) uzak istek hiç yapılmaz.
     """
 
     suggestions_ready = pyqtSignal(str, list)  # (query, [str, ...])
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, engine: str = "brave"):
         super().__init__(parent)
         self._manager = QNetworkAccessManager(self)
         self._reply = None
         self._pending_query = ""
+        self._engine = engine
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(DEBOUNCE_MS)
         self._debounce.timeout.connect(self._fire_request)
 
+    def set_engine(self, engine: str):
+        if engine != self._engine:
+            self._engine = engine
+            self.cancel()
+
     def request(self, query: str):
         self._pending_query = query
         self._debounce.start()
 
+    def _abort_reply(self, reply: "QNetworkReply"):
+        """İptal edilen QNetworkReply'yi finished bağlantısından koparıp
+        abort+deleteLater yapar. Sızıntı notu: eskiden cancel() yalnızca
+        abort edip referansı düşürüyordu; finished sinyali geldiğinde
+        _on_finished reply None görüp erken döndüğünden deleteLater HİÇ
+        çağrılmıyor ve her tuş vuruşunda bir QNetworkReply birikiyordu.
+        Ayrıca _fire_request'teki 'eski isteği iptal et' yolu, eski reply'ın
+        finished'ını bağlı bırakıyordu — geç ateşlendiğinde YENİ reply'ı
+        erken deleteLater edip verisini düşürüyordu. İki hata da burada
+        bağlantı koparılarak giderilir."""
+        try:
+            reply.finished.disconnect()
+        except TypeError:
+            pass
+        reply.abort()
+        reply.deleteLater()
+
     def cancel(self):
         self._debounce.stop()
         if self._reply is not None:
-            self._reply.abort()
-            self._reply = None
+            reply, self._reply = self._reply, None
+            self._abort_reply(reply)
 
     def _fire_request(self):
         query = self._pending_query
         if not query.strip():
             return
+        endpoint = suggest_url_for(self._engine)
+        if not endpoint:
+            return  # bu motor için uzak öneri desteklenmiyor
         if self._reply is not None:
-            self._reply.abort()
-            self._reply = None
+            old, self._reply = self._reply, None
+            self._abort_reply(old)
 
         encoded = QUrl.toPercentEncoding(query).data().decode("ascii")
-        req = QNetworkRequest(QUrl(SUGGEST_ENDPOINT + encoded))
-        # Brave'in öneri uç noktası, tarayıcı olmayan/UA'sız isteklere karşı
-        # daha seçici davranabiliyor; gerçek bir tarayıcıdan geldiğini
-        # belirtmek için standart bir User-Agent ve Referer ekleniyor.
+        req = QNetworkRequest(QUrl(endpoint + encoded))
+        # Bu uç noktalar tarayıcı olmayan/UA'sız isteklere karşı daha
+        # seçici davranabiliyor; gerçek bir tarayıcıdan geldiğini belirtmek
+        # için standart bir User-Agent ekleniyor.
         req.setRawHeader(b"User-Agent", b"Mozilla/5.0 (X11; Linux x86_64) GEM-Browser/1.0")
-        req.setRawHeader(b"Referer", b"https://search.brave.com/")
         req.setRawHeader(b"Accept", b"application/json")
-        self._reply = self._manager.get(req)
-        self._reply.finished.connect(lambda q=query: self._on_finished(q))
+        reply = self._manager.get(req)
+        self._reply = reply
+        # reply'ı lambda'ya kapatarak yakala: finished geldiğinde
+        # self._reply artık başka (yeni) bir istek olabilir.
+        reply.finished.connect(lambda q=query, r=reply: self._on_finished(q, r))
 
-    def _on_finished(self, query: str):
-        reply = self._reply
-        self._reply = None
-        if reply is None:
-            return
+    def _on_finished(self, query: str, reply: "QNetworkReply"):
+        if self._reply is reply:
+            self._reply = None
         try:
             if reply.error() == QNetworkReply.NetworkError.NoError:
                 raw = bytes(reply.readAll())
                 data = json.loads(raw.decode("utf-8", errors="ignore"))
-                # Brave'in "suggest" uç noktası standart OpenSearch
-                # autocomplete biçimini döndürür: ["sorgu", ["öneri1", ...]]
-                items = data[1] if isinstance(data, list) and len(data) > 1 else []
-                items = [s for s in items if isinstance(s, str)]
+                items = _extract_suggestions(data)
                 self.suggestions_ready.emit(query, items[:MAX_REMOTE_SUGGESTIONS])
         except Exception:
             pass
@@ -154,17 +230,6 @@ class RemoteSuggester(QObject):
 
 
 # --------------------------------------------------------------- arayüz ---
-
-_DARK = {
-    "bg": "#242424", "border": "rgba(255, 255, 255, 0.08)", "text": "#ffffff",
-    "muted": "#909090", "hover": "rgba(255, 255, 255, 0.06)",
-    "sel": "rgba(61, 174, 233, 0.20)", "accent": "#3daee9",
-}
-_LIGHT = {
-    "bg": "#ffffff", "border": "rgba(0, 0, 0, 0.08)", "text": "#1a1a1a",
-    "muted": "#707070", "hover": "rgba(0, 0, 0, 0.05)",
-    "sel": "rgba(0, 120, 215, 0.14)", "accent": "#0078d7",
-}
 
 # Satır simgeleri artık emoji değil, toolbar/menüde de kullanılan aynı ince
 # çizgili SVG ikon seti (bkz. icons.py) — böylece adres çubuğu önerileri de
@@ -209,6 +274,60 @@ def _elide(text: str, font, max_width: int) -> str:
     return fm.elidedText(text, Qt.TextElideMode.ElideRight, max_width)
 
 
+class _SuggestRow(QWidget):
+    """Öneri satırı. Satırlar setItemWidget ile listeye konulan özel
+    widget'lar olduğundan, QListWidget::item:selected / ::hover arka
+    planları satırın ARKASINDA kalıp görünmüyordu (kullanıcı ok tuşlarıyla
+    gezinirken hangi satırda olduğunu anlayamıyordu). Bu yüzden satır,
+    seçili/hover durumunu KENDİ arka planını çizerek gösterir."""
+
+    def __init__(self, popup, is_primary: bool):
+        super().__init__()
+        self._popup = popup
+        self._is_primary = is_primary
+        self._selected = False
+        self._hovered = False
+        # ÖNEMLİ: düz QWidget, stylesheet arka planını ancak bu öznitelikle
+        # boyar; olmadan setStyleSheet background tamamen yok sayılır.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setObjectName("primaryRow" if is_primary else "suggestRow")
+        self._restyle()
+
+    @property
+    def is_primary(self) -> bool:
+        return self._is_primary
+
+    def set_selected(self, selected: bool):
+        if self._selected != selected:
+            self._selected = selected
+            self._restyle()
+
+    def _restyle(self):
+        colors = self._popup._colors
+        if self._selected:
+            bg = colors["sel_strong"]
+        elif self._hovered:
+            bg = colors["hover"]
+        elif self._is_primary:
+            bg = colors["sel"]
+        else:
+            bg = "transparent"
+        self.setStyleSheet(
+            f"QWidget#{self.objectName()} {{ background-color: {bg}; "
+            "border-radius: 8px; }"
+        )
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self._restyle()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self._restyle()
+        super().leaveEvent(event)
+
+
 class SuggestionPopup(QWidget):
     """
     Adres çubuğunun hemen altına açılan, tıklanabilir/ok tuşlarıyla
@@ -222,13 +341,13 @@ class SuggestionPopup(QWidget):
 
     item_chosen = pyqtSignal(str, str)  # (kind, value)
 
-    def __init__(self, parent, theme: str = "dark"):
+    def __init__(self, parent, theme: str = "dark", accent: str = None):
         super().__init__(parent, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        self._colors = _LIGHT if theme == "light" else _DARK
+        self._colors = _popup_colors(theme, accent)
         self._entries = []  # [(kind, value)]
 
         outer = QVBoxLayout(self)
@@ -260,6 +379,10 @@ class SuggestionPopup(QWidget):
         self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list_widget.itemClicked.connect(self._on_item_clicked)
+        # Ok tuşlarıyla gezinmede seçili satırı _SuggestRow üzerinden çiz
+        # (bkz. _SuggestRow neden yazıldı).
+        self.list_widget.currentRowChanged.connect(self._sync_row_selection)
+        self._rows = []
         card_layout.addWidget(self.list_widget)
 
         shadow = QGraphicsDropShadowEffect(card)
@@ -290,6 +413,7 @@ class SuggestionPopup(QWidget):
         """
         self.list_widget.clear()
         self._entries = []
+        self._rows = []
         colors = self._colors
 
         # Etiketlerin taşmaması için kullanılabilir metin genişliği: popup
@@ -309,19 +433,10 @@ class SuggestionPopup(QWidget):
             is_primary = bool(e.get("primary"))
 
             item = QListWidgetItem(self.list_widget)
-            row = QWidget()
-            row.setObjectName("primaryRow" if is_primary else "suggestRow")
+            row = _SuggestRow(self, is_primary)
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(self.ROW_MARGIN_H, 7, self.ROW_MARGIN_H, 7)
             row_layout.setSpacing(self.ROW_SPACING)
-            if is_primary:
-                # Diğer satırlarla aynı yapışık/köşesiz düzende kalır, sadece
-                # arka plan rengiyle (hover beklemeden) hafifçe öne çıkar —
-                # Google'ın "sorguyu ara" satırı gibi ama Chrome'daki gibi
-                # kesintisiz/boşluksuz.
-                row.setStyleSheet(
-                    f"QWidget#primaryRow {{ background-color: {colors['sel']}; }}"
-                )
 
             icon_lbl = QLabel()
             icon_lbl.setPixmap(self._kind_icon_pixmap(e["kind"], is_primary))
@@ -358,12 +473,23 @@ class SuggestionPopup(QWidget):
             self.list_widget.addItem(item)
             self.list_widget.setItemWidget(item, row)
             self._entries.append((e["kind"], e["value"]))
+            self._rows.append(row)
 
         self.list_widget.setCurrentRow(-1)
         row_h = self.list_widget.sizeHintForRow(0) if self.list_widget.count() else 0
         total_h = min(row_h * self.list_widget.count() + 15, 360)
         self.setFixedHeight(max(total_h, 1))
         self.adjustSize()
+
+    def _sync_row_selection(self, index: int):
+        """Ok tuşlarıyla (move_selection) veya tıklamayla değişen geçerli
+        satırı, satır widget'larının kendi arka planlarına yansıtır."""
+        for i, row in enumerate(self._rows):
+            try:
+                row.set_selected(i == index)
+            except RuntimeError:
+                # Liste clear() sonrası eski satır C++ nesnesi ölmüş olabilir.
+                continue
 
     def _on_item_clicked(self, item):
         idx = self.list_widget.row(item)

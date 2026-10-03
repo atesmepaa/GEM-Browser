@@ -1,7 +1,10 @@
 import os
 import json
+import subprocess
+import sys
+import tempfile
 import time
-from PyQt6.QtCore import QObject, Qt, pyqtSignal, QTimer
+from PyQt6.QtCore import QObject, Qt, pyqtSignal, QTimer, QUrl
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QDialog, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QProgressBar
@@ -9,6 +12,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtWebEngineCore import QWebEngineDownloadRequest
 
 from gem_browser.paths import config_path, secure_chmod
+from gem_browser.modern_popup import show_modern_confirm
 
 HISTORY_FILE = config_path("gem_downloads.json")
 
@@ -134,9 +138,95 @@ class DownloadManager(QObject):
         self.history_changed.emit()
 
     # ---------------- İndirme akışı ----------------
+    @staticmethod
+    def _open_path_system(path: str):
+        """Dosyayı/klasörü işletim sisteminin varsayılan uygulamasıyla açar."""
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)  # noqa: S606
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_pdf(download_request) -> bool:
+        name = (download_request.downloadFileName() or "").lower()
+        url_path = (download_request.url().toString() or "").split("?")[0].split("#")[0].lower()
+        return name.endswith(".pdf") or url_path.endswith(".pdf")
+
+    def _pdf_downloaded_open(self, state, path: str, lang: str):
+        """Sessiz PDF indirmesi tamamlandığında sistem görüntüleyicide açar."""
+        if state == QWebEngineDownloadRequest.DownloadState.DownloadCompleted:
+            self._open_path_system(path)
+
+    def _try_open_pdf_externally(self, download_request, default_name: str, lang: str) -> bool:
+        """
+        PDF'ler için sistem görüntüleyici akışı. True dönerse istek tüketildi
+        (çağıran hiçbir şey yapmamalı).
+
+        Neden: bu sistemdeki QtWebEngine paketi, Chromium'un yerleşik PDF
+        görüntüleyicisinin kaynakları ÇIKARTILMIŞ şekilde derlenmiş
+        (resources.pak içinde uzantı içeriği yok); PdfViewerEnabled ayarı bu
+        yüzden etkisiz ve PDF'ler normal indirmeye düşüyor.
+        """
+        if not self._is_pdf(download_request):
+            return False
+
+        url_str = download_request.url().toString()
+        # Görüntüleyicinin "İndir" düğmesi _gemview=1 işaretli istekle
+        # indirmeyi başlatır: kullanıcı kasıtlı olarak indirmek istiyor —
+        # sistem-görüntüleyici onayı olmadan normal "Kaydet" akışına düş.
+        if "_gemview=" in url_str:
+            return False
+
+        # 1) Yerel dosya: indirmeye gerek yok, doğrudan sistemde aç.
+        if url_str.startswith("file://"):
+            local = QUrl(url_str).toLocalFile()
+            if local and os.path.exists(local):
+                download_request.cancel()
+                self._open_path_system(local)
+                return True
+
+        # 2) Uzak PDF: kullanıcı isterse sessizce indirip sistemde aç.
+        if self.parent is not None:
+            self.parent.show()
+            self.parent.raise_()
+            self.parent.activateWindow()
+        msg = (
+            "GEM Browser bu sistemde PDF'leri sekme içinde açamıyor "
+            "(QtWebEngine paketinde yerleşik PDF görüntüleyici kaynakları yok). "
+            "Dosya sessizce indirilip sistem PDF görüntüleyicinizde açılsın mı?"
+            if lang == "tr" else
+            "GEM Browser cannot open PDFs in a tab on this system "
+            "(the QtWebEngine package ships without built-in PDF viewer resources). "
+            "Download the file silently and open it in your system PDF viewer?"
+        )
+        title = "PDF Görüntüleyici" if lang == "tr" else "PDF Viewer"
+        if show_modern_confirm(self.parent, msg, title=title, lang=lang):
+            tmp_dir = tempfile.mkdtemp(prefix="gem_pdf_")
+            safe_name = os.path.basename(default_name) or "belge.pdf"
+            target = os.path.join(tmp_dir, safe_name)
+            download_request.setDownloadDirectory(tmp_dir)
+            download_request.setDownloadFileName(safe_name)
+            download_request.stateChanged.connect(
+                lambda state, p=target, l=lang: self._pdf_downloaded_open(state, p, l))
+            download_request.accept()
+            return True
+        # Kullanıcı istemedi: False -> çağıran normal "Kaydet" akışına döner.
+        return False
+
     def handle_download(self, download_request):
         lang = getattr(self.parent, "lang", "tr") if self.parent else "tr"
         default_name = download_request.downloadFileName()
+
+        # PDF'ler önce özel akışa (sistem görüntüleyici); ele alındıysa
+        # kaydetme diyaloğunu hiç açma.
+        if self._try_open_pdf_externally(download_request, default_name, lang):
+            return
+
         default_dir = os.path.join(os.path.expanduser("~"), "Downloads")
 
         try:
@@ -210,7 +300,7 @@ class DownloadManager(QObject):
         total = request.totalBytes()
 
         elapsed = time.time() - data["start_time"]
-        speed_mbps = (received / elapsed) / (1024 * 1024) if elapsed > 0 else 0
+        speed_mb_s = (received / elapsed) / (1024 * 1024) if elapsed > 0 else 0
         rec_mb = received / (1024 * 1024)
 
         if total > 0:
@@ -220,16 +310,16 @@ class DownloadManager(QObject):
             size_mb = total / (1024 * 1024)
 
             if data["lang"] == "tr":
-                text = f"{data['name']}\n{rec_mb:.1f} MB / {size_mb:.1f} MB  —  Hız: {speed_mbps:.1f} MB/s"
+                text = f"{data['name']}\n{rec_mb:.1f} MB / {size_mb:.1f} MB  —  Hız: {speed_mb_s:.1f} MB/s"
             else:
-                text = f"{data['name']}\n{rec_mb:.1f} MB / {size_mb:.1f} MB  —  Speed: {speed_mbps:.1f} MB/s"
+                text = f"{data['name']}\n{rec_mb:.1f} MB / {size_mb:.1f} MB  —  Speed: {speed_mb_s:.1f} MB/s"
             popup.label.setText(text)
         else:
             popup.bar.setRange(0, 0)
             if data["lang"] == "tr":
-                text = f"{data['name']}\nİndirilen: {rec_mb:.1f} MB  —  Hız: {speed_mbps:.1f} MB/s"
+                text = f"{data['name']}\nİndirilen: {rec_mb:.1f} MB  —  Hız: {speed_mb_s:.1f} MB/s"
             else:
-                text = f"{data['name']}\nDownloaded: {rec_mb:.1f} MB  —  Speed: {speed_mbps:.1f} MB/s"
+                text = f"{data['name']}\nDownloaded: {rec_mb:.1f} MB  —  Speed: {speed_mb_s:.1f} MB/s"
             popup.label.setText(text)
 
     def state_changed(self, req_id, state):

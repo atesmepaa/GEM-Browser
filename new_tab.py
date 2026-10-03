@@ -1,31 +1,61 @@
 import os
 import json
 import tempfile
-from urllib.parse import urlparse
+import hashlib
+import glob
+from urllib.parse import urlparse, quote
 
 from gem_browser.paths import config_path, secure_chmod
 from gem_browser import theme as gem_theme
 from gem_browser import icons as gem_icons
+from gem_browser.router import build_search_url
 
 BOOKMARKS_FILE = config_path("bookmarks.json")
 
+# Bellek içi favori önbelleği: adres çubuğu önerileri ve yıldız her URL
+# değişiminde load_bookmarks() çağırdığından her seferinde disk okunuyordu.
+# Değişiklik yalnızca save_bookmarks() üzerinden olur; dışsal dosya
+# değişimi (elle düzenleme) ancak uygulama yeniden başlatınca görünür —
+# kabul edilebilir takas.
+_BOOKMARK_CACHE = None
+
+
 def load_bookmarks():
+    global _BOOKMARK_CACHE
+    if _BOOKMARK_CACHE is not None:
+        return list(_BOOKMARK_CACHE)  # çağıranın listeyi değiştirmesi önbelleği bozmasın
+    loaded = None
     if os.path.exists(BOOKMARKS_FILE):
         try:
             with open(BOOKMARKS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            pass
-    return [
-        {"name": "GitHub", "url": "https://github.com"},
-        {"name": "DuckDuckGo", "url": "https://duckduckgo.com"},
-        {"name": "YouTube", "url": "https://youtube.com"}
-    ]
+                data = json.load(f)
+            if isinstance(data, list):
+                # Bozuk/elle düzenlenmiş dosyada KeyError/AttributeError
+                # yerine geçerli girdileri süz.
+                loaded = [b for b in data if isinstance(b, dict)
+                          and isinstance(b.get("url"), str) and b["url"].strip()]
+        except Exception:
+            loaded = None
+    if loaded is None:
+        loaded = [
+            {"name": "GitHub", "url": "https://github.com"},
+            {"name": "DuckDuckGo", "url": "https://duckduckgo.com"},
+            {"name": "YouTube", "url": "https://youtube.com"}
+        ]
+    _BOOKMARK_CACHE = loaded
+    return list(loaded)
+
 
 def save_bookmarks(bookmarks):
-    with open(BOOKMARKS_FILE, "w", encoding="utf-8") as f:
-        json.dump(bookmarks, f, indent=4, ensure_ascii=False)
-    secure_chmod(BOOKMARKS_FILE)
+    global _BOOKMARK_CACHE
+    # Önbelleği kaydedilen kopyayla güncelle (sonraki load disk okumaz).
+    _BOOKMARK_CACHE = [dict(b) for b in bookmarks]
+    try:
+        with open(BOOKMARKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(bookmarks, f, indent=4, ensure_ascii=False)
+        secure_chmod(BOOKMARKS_FILE)
+    except OSError:
+        pass
 
 NEW_TAB_HTML = """<!DOCTYPE html>
 <html lang="tr">
@@ -45,7 +75,7 @@ NEW_TAB_HTML = """<!DOCTYPE html>
             --tile-bg: TILE_BG_PLACEHOLDER;
             --tile-hover: TILE_HOVER_PLACEHOLDER;
         }
-        
+
         body {
             font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
             background: BODY_BACKGROUND_PLACEHOLDER;
@@ -59,7 +89,7 @@ NEW_TAB_HTML = """<!DOCTYPE html>
             align-items: center;
             height: 100vh;
             margin: 0;
-            padding-bottom: 8vh; 
+            padding-bottom: 8vh;
             box-sizing: border-box;
             overflow: hidden;
         }
@@ -89,7 +119,7 @@ NEW_TAB_HTML = """<!DOCTYPE html>
                 animation: none;
             }
         }
-        
+
         .logo-container {
             margin-bottom: 25px;
             text-align: center;
@@ -98,16 +128,16 @@ NEW_TAB_HTML = """<!DOCTYPE html>
             flex-direction: column;
             align-items: center;
         }
-        
+
         .logo-container img { width: 100px; height: auto; margin-bottom: 10px; filter: drop-shadow(0 0 15px var(--accent-glow)); }
         .brand-title { font-size: 1.4rem; font-weight: 300; letter-spacing: 6px; margin: 0; color: var(--text-main); }
         .search-container { width: 100%; max-width: 600px; }
         .search-wrapper { position: relative; width: 100%; }
-        
+
         .search-icon {
             position: absolute; left: 20px; top: 50%; transform: translateY(-50%); width: 20px; height: 20px; fill: var(--text-muted); pointer-events: none;
         }
-        
+
         input[type="text"] {
             width: 100%; box-sizing: border-box; background-color: var(--input-bg); color: var(--text-main);
             border: 1px solid var(--input-border); border-radius: 30px; padding: 16px 20px 16px 52px;
@@ -115,7 +145,7 @@ NEW_TAB_HTML = """<!DOCTYPE html>
             font-size: 1.02rem; font-weight: 400; letter-spacing: 0.1px;
             outline: none; backdrop-filter: blur(10px); transition: all 0.3s ease;
         }
-        
+
         input[type="text"]:focus { border-color: var(--accent-color); box-shadow: 0 0 20px var(--accent-glow); }
 
         .bookmarks-grid {
@@ -169,17 +199,23 @@ NEW_TAB_HTML = """<!DOCTYPE html>
             event.preventDefault();
             var query = document.getElementById('searchInput').value.trim();
             if (!query) return;
+            // Güvenlik: betik şemalarını adres/sorgu olarak asla gezinme.
+            var lower = query.toLowerCase();
+            if (lower.indexOf('javascript:') === 0 || lower.indexOf('data:') === 0 || lower.indexOf('vbscript:') === 0) return;
             if (query.includes('://')) window.location.href = query;
             else if (query.includes('.') && !query.includes(' ')) window.location.href = 'https://' + query;
-            else window.location.href = 'https://search.brave.com/search?q=' + encodeURIComponent(query);
+            else window.location.href = 'SEARCH_URL_PREFIX_PLACEHOLDER' + encodeURIComponent(query);
         }
 
         function addBookmark() {
-            window.location.href = "gemaction://request_add_bookmark";
+            // Qt 6.11 bilinmeyen şemalara location.href gezinmesini düşürdüğü
+            // için uygulama eylemleri console kanalından iletilir
+            // (browser_tab.javaScriptConsoleMessage yakalar).
+            console.log("gemaction:request_add_bookmark");
         }
 
         function removeBookmark(url) {
-            window.location.href = "gemaction://request_remove_bookmark?url=" + encodeURIComponent(url);
+            console.log("gemaction:request_remove_bookmark " + encodeURIComponent(url));
         }
 
         // Favicon indirilemediğinde (ör. bağlantı yok, site favicon sunmuyor)
@@ -206,7 +242,7 @@ NEW_TAB_HTML = """<!DOCTYPE html>
         <img src="LOGO_URL_PLACEHOLDER" alt="GEM Logo" style="display: LOGO_DISPLAY_PLACEHOLDER;">
         <div class="brand-title">GEM BROWSER</div>
     </div>
-    
+
     <div class="search-container">
         <form onsubmit="handleSearch(event)">
             <div class="search-wrapper">
@@ -224,33 +260,81 @@ NEW_TAB_HTML = """<!DOCTYPE html>
 </html>
 """
 
-_cached_new_tab_paths = {}
-
-def get_new_tab_url(theme="dark", lang="tr", accent_color=None, background_image=None) -> str:
+def get_new_tab_url(theme="dark", lang="tr", accent_color=None, background_image=None,
+                    search_engine="brave", custom_search_url="") -> str:
     """
     `accent_color`: "#rrggbb" formatında, None/boş ise temaya göre varsayılan
     kullanılır (bkz. gem_browser/theme.py).
     `background_image`: kullanıcının Ayarlar'dan seçip config dizinine
     kopyalattığı görselin tam disk yolu. None/boş veya dosya artık yoksa
     (silinmiş/taşınmışsa) sessizce varsayılan gradyan arkaplana düşülür.
+    `search_engine`/`custom_search_url`: sayfadaki arama kutusunun gideceği
+    motor (bkz. router.build_search_url).
     """
-    global _cached_new_tab_paths
     bookmarks = load_bookmarks()
 
     accent = accent_color if gem_theme._is_valid_hex_color(accent_color or "") else gem_theme.default_accent_for_theme(theme)
+
+    # Arama kutusu JS'ine gömülecek URL öneki. Özel motorda "{q}" yer
+    # tutucusu varsa önek kısmı (ilk "{q}"den önceki bölüm) alınır.
+    custom = (custom_search_url or "").strip()
+    if custom and "{q}" in custom:
+        search_prefix = custom.split("{q}", 1)[0]
+    else:
+        search_prefix = build_search_url("", search_engine, custom)
+    # JS tek tırnaklı string içine gömülecek: kaçış.
+    search_prefix_js = search_prefix.replace("\\", "\\\\").replace("'", "\\'")
 
     bg_url = ""
     if background_image and os.path.exists(background_image):
         bg_path = os.path.abspath(background_image).replace("\\", "/")
         if not bg_path.startswith('/'):
             bg_path = '/' + bg_path
-        bg_url = f"file://{bg_path}"
+        # Yol boşluk veya Türkçe/aksanlı karakterler içerebilir (ör.
+        # "/home/Ahmet Yılmaz/Masaüstü/foo.jpg"). file:// URL'leri
+        # ham (encode edilmemiş) haliyle geçersiz/bozuk sayılabilir ve
+        # QtWebEngine görseli hiç yüklemez — görsel "kayboluyormuş" gibi
+        # görünür ama aslında hiç geçerli bir URL olmamıştır. quote()
+        # ile path segmentlerini encode ediyoruz, '/' ayıracını koruyoruz.
+        bg_url = f"file://{quote(bg_path)}"
 
     # Arkaplan görseli, tema ve dil dışında ARTIK vurgu rengine ve arkaplan
     # görseline göre de değişebildiği için önbellek anahtarına ikisi de
     # dahil edildi — aksi halde renk/görsel değiştirildiğinde eski
     # önbellekteki HTML gösterilmeye devam ederdi.
-    cache_key = f"{theme}_{lang}_{len(bookmarks)}_{accent.lstrip('#')}_{abs(hash(bg_url)) % 100000}"
+    #
+    # NOT: burada Python'un yerleşik hash() fonksiyonu YERİNE hashlib
+    # kullanılıyor. hash(str) süreçten sürece rastgele bir tuz (hash
+    # randomization / PYTHONHASHSEED) ile hesaplanır; yani uygulama her
+    # yeniden başlatıldığında AYNI arkaplan için FARKLI bir cache_key
+    # üretilir. Bu hem gereksiz yere temp klasöründe eski HTML dosyalarının
+    # sonsuza dek birikmesine (hiç silinmeden) yol açar, hem de teorik
+    # olarak temp dizini/disk kotası dolduğunda aşağıdaki dosya yazımının
+    # sessizce patlamasına zemin hazırlar. hashlib ile deterministik bir
+    # anahtar üretilir.
+    bg_hash = hashlib.md5(bg_url.encode("utf-8")).hexdigest()[:10]
+    # Arama motoru da önbellek anahtarına dahil — aksi halde motor
+    # değiştirilince eski önbellekteki HTML (eski motorla) gösterilirdi.
+    engine_part = f"{search_engine}_{hashlib.md5(custom.encode('utf-8')).hexdigest()[:8] if custom else ''}"
+    cache_key = f"{theme}_{lang}_{len(bookmarks)}_{accent.lstrip('#')}_{bg_hash}_{engine_part}"
+
+    # Bu belirli state (tema/dil/yer imi sayısı/renk/arkaplan) için üretilen
+    # HTML dosyası dışındaki eski "gem_browser_new_tab_*.html" dosyalarını
+    # best-effort temizle. Aksi halde her farklı ayar kombinasyonu temp
+    # dizininde kalıcı bir dosya biriktirir; bu hem gereksiz disk kullanımı
+    # hem de (nadir de olsa) dizinin dolup yeni dosya yazımını
+    # başarısız kılma riski demektir. Silme başarısız olursa (ör. dosya
+    # o an başka bir sekme tarafından kullanılıyor) sessizce geçilir.
+    try:
+        current_name = f"gem_browser_new_tab_{cache_key}.html"
+        for old_file in glob.glob(os.path.join(tempfile.gettempdir(), "gem_browser_new_tab_*.html")):
+            if os.path.basename(old_file) != current_name:
+                try:
+                    os.remove(old_file)
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -269,15 +353,19 @@ def get_new_tab_url(theme="dark", lang="tr", accent_color=None, background_image
     if os.path.exists(logo_path):
         if not logo_path.startswith('/'):
             logo_path = '/' + logo_path
-        logo_url = f"file://{logo_path}"
+        # bg_url ile aynı gerekçe: encode edilmemiş bir file:// URL,
+        # kullanıcı adında/config dizininde boşluk ya da Türkçe karakter
+        # varsa tarayıcı tarafında sessizce yüklenemeyebilir ve logo hiç
+        # görünmez. quote() ile güvenli hale getiriyoruz.
+        logo_url = f"file://{quote(logo_path)}"
     else:
         logo_url = ""
-    
+
     logo_display = "block" if logo_url else "none"
 
     temp_dir = tempfile.gettempdir()
     file_path = os.path.join(temp_dir, f"gem_browser_new_tab_{cache_key}.html")
-    
+
     final_html = NEW_TAB_HTML.replace("LOGO_URL_PLACEHOLDER", logo_url)
     final_html = final_html.replace("LOGO_DISPLAY_PLACEHOLDER", logo_display)
 
@@ -296,37 +384,50 @@ def get_new_tab_url(theme="dark", lang="tr", accent_color=None, background_image
     placeholder = "Web'de arayın veya bir URL girin..." if lang == "tr" else "Search the web or enter a URL..."
     title = "Yeni Sekme" if lang == "tr" else "New Tab"
     add_btn_text = "+ EKLE" if lang == "tr" else "+ ADD"
-    
+
     final_html = final_html.replace("SEARCH_PLACEHOLDER", placeholder)
+    final_html = final_html.replace("SEARCH_URL_PREFIX_PLACEHOLDER", search_prefix_js)
     final_html = final_html.replace("NEW_TAB_TITLE", title)
     final_html = final_html.replace("ADD_BTN_PLACEHOLDER", add_btn_text)
-    
+
     def _esc(s):
         return (s or "").replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _js_str(s):
+        # JS tek tırnaklı string içine gömme için: ters bölü, tırnak ve
+        # satır sonlarını kaçır.
+        return (s or "").replace("\\", "\\\\").replace("'", "\\'").replace("\r", "").replace("\n", "\\n")
 
     bm_html = ""
     for bm in bookmarks:
         # Daha güvenilir favicon çekimi için DuckDuckGo Icon API kullanımı
         parsed_url = urlparse(bm["url"])
         domain = parsed_url.netloc
-        if not domain: 
+        if not domain:
             domain = bm["url"].replace('https://', '').replace('http://', '').split('/')[0]
-            
-        icon_url = f"https://icons.duckduckgo.com/ip3/{domain}.ico"
+
+        icon_url = f"https://icons.duckduckgo.com/ip3/{quote(domain, safe='')}.ico"
         safe_name = _esc(bm["name"])
+        # GÜVENLİK: URL, href özniteliğine VE onclick JS string'ine gömülür;
+        # kaçış yapılmayan bir URL (' " < > içererek) HTML'i bozar/JS
+        # enjekte ederdi. Önce JS-string kaçışı, ardından HTML öznitelik
+        # kaçışı uygulanır (HTML ayrıştırıcı &quot; decode edip JS'e düz
+        # " olarak iletir; JS string'i tek tırnaklı olduğu için güvenli).
+        safe_href = _esc(bm["url"])
+        safe_js_url = _esc(_js_str(bm["url"]))
 
         bm_html += (
-            f'<a href="{bm["url"]}" class="bookmark-tile">'
+            f'<a href="{safe_href}" class="bookmark-tile">'
             f'<span class="bookmark-icon-wrap" data-name="{safe_name}">'
             f'<img src="{icon_url}" class="bookmark-icon" alt="" onerror="gemFaviconFallback(this)">'
             f'</span>'
             f'{safe_name}'
-            f'<span class="del-btn" onclick="event.preventDefault(); removeBookmark(\'{bm["url"]}\')">×</span>'
+            f'<span class="del-btn" onclick="event.preventDefault(); removeBookmark(\'{safe_js_url}\')">×</span>'
             f'</a>'
         )
-    
+
     final_html = final_html.replace("BOOKMARKS_HTML_PLACEHOLDER", bm_html)
-    
+
     if theme == "light":
         final_html = final_html.replace("BG_CENTER_PLACEHOLDER", "#ffffff").replace("BG_EDGE_PLACEHOLDER", "#e6e6e6")
         final_html = final_html.replace("TEXT_MAIN_PLACEHOLDER", "#1a1a1a").replace("TEXT_MUTED_PLACEHOLDER", "#666666")
@@ -337,8 +438,16 @@ def get_new_tab_url(theme="dark", lang="tr", accent_color=None, background_image
         final_html = final_html.replace("TEXT_MAIN_PLACEHOLDER", "#ffffff").replace("TEXT_MUTED_PLACEHOLDER", "#6b6b76")
         final_html = final_html.replace("INPUT_BG_PLACEHOLDER", "rgba(255, 255, 255, 0.03)").replace("INPUT_BORDER_PLACEHOLDER", "rgba(255, 255, 255, 0.08)")
         final_html = final_html.replace("TILE_BG_PLACEHOLDER", "rgba(255, 255, 255, 0.04)").replace("TILE_HOVER_PLACEHOLDER", "rgba(255, 255, 255, 0.08)")
-    
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(final_html)
-        
-    return f"file://{file_path}"
+
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(final_html)
+    except OSError:
+        # Disk dolu/izin hatası: temp HTML yazılamazsa bozuk bir dosya
+        # göstermek yerine boş sayfaya düş (çağıran taraf sekme açar).
+        return "about:blank"
+
+    # Temp dizini yolu da (Windows'ta "AppData\Local\Temp\Ahmet Yılmaz\..."
+    # gibi) boşluk/Türkçe karakter içerebileceğinden, sekmeye yüklenecek
+    # asıl HTML sayfasının URL'sini de encode ediyoruz.
+    return f"file://{quote(file_path.replace(os.sep, '/'))}"

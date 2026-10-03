@@ -30,7 +30,11 @@ def load_history() -> list:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, list):
-                    return data
+                    # Bozuk/elle düzenlenmiş dosyada add_entry'in
+                    # entries[-1].get(...) çağrısı AttributeError ile
+                    # çökmesin; yalnızca geçerli girdileri kabul et.
+                    return [e for e in data
+                            if isinstance(e, dict) and isinstance(e.get("url"), str) and e["url"]]
         except Exception:
             pass
     return []
@@ -45,12 +49,15 @@ def save_history(entries: list) -> None:
         pass
 
 
-def add_entry(entries: list, url: str, title: str = "") -> list:
+def add_entry(entries: list, url: str, title: str = "", save: bool = True) -> list:
     """
-    Verilen listeye (bellekteki güncel geçmiş) yeni bir ziyareti ekler ve
-    diske yazar. Aynı sayfada art arda gelen güncellemeler (ör. sekme
-    başlığı sayfa yüklendikten sonra değişirse) yeni bir satır açmak yerine
-    son satırı günceller. Güncellenmiş listeyi döndürür.
+    Verilen listeye (bellekteki güncel geçmiş) yeni bir ziyareti ekler;
+    save=True ise diske yazar. Hızlı gezinmede her yüklemede tüm geçmiş
+    dosyasını yazmamak için arayüz save=False geçirip gecikmeli olarak
+    save_history() çağırabilir (bkz. window.py _flush_history).
+    Aynı sayfada art arda gelen güncellemeler (ör. sekme başlığı sayfa
+    yüklendikten sonra değişirse) yeni bir satır açmak yerine son satırı
+    günceller. Güncellenmiş listeyi döndürür.
     """
     if entries and entries[-1].get("url") == url:
         entries[-1]["title"] = title or entries[-1].get("title", "")
@@ -61,7 +68,8 @@ def add_entry(entries: list, url: str, title: str = "") -> list:
     if len(entries) > MAX_HISTORY_ENTRIES:
         entries = entries[-MAX_HISTORY_ENTRIES:]
 
-    save_history(entries)
+    if save:
+        save_history(entries)
     return entries
 
 

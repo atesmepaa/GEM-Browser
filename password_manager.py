@@ -38,6 +38,13 @@ class WrongMasterPassword(Exception):
     pass
 
 
+class CorruptVault(Exception):
+    """Kasa meta dosyası (gem_vault_meta.json) okunamıyor/bozuk; parola
+    ne olursa olsun kasa açılamaz. Çağıran taraf bunu WrongMasterPassword'dan
+    AYRI yakalamalıdır — parolayı tekrar sormak çözüm değildir."""
+    pass
+
+
 def vault_exists() -> bool:
     """Daha önce bir ana parola ile kasa oluşturulmuş mu?"""
     return os.path.exists(META_FILE)
@@ -88,16 +95,26 @@ class PasswordVault:
         if not master_password:
             raise ValueError("master_password boş olamaz")
 
+        cipher = None
         if os.path.exists(META_FILE):
-            with open(META_FILE, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            salt = base64.b64decode(meta["salt"])
-            key = _derive_key(master_password, salt)
-            cipher = Fernet(key)
             try:
+                with open(META_FILE, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                salt = base64.b64decode(meta["salt"])
+                key = _derive_key(master_password, salt)
+                cipher = Fernet(key)
                 cipher.decrypt(base64.b64decode(meta["check"]))
             except InvalidToken:
                 raise WrongMasterPassword()
+            except WrongMasterPassword:
+                raise
+            except Exception as exc:
+                # Bozuk/eksik meta (geçersiz JSON, kayıp "salt"/"check"
+                # anahtarı, bozuk base64...): eskiden buradaki yakalanmamış
+                # istisna çağıranın (window.py) except WrongMasterPassword
+                # bloğunu aşıp uygulamayı çökertiyordu. Bilinçli olarak
+                # CorruptVault olarak yeniden fırlat.
+                raise CorruptVault(str(exc)) from exc
         else:
             # İlk kurulum: yeni salt üret, canary'i şifreleyip kaydet.
             salt = secrets.token_bytes(16)
@@ -107,8 +124,11 @@ class PasswordVault:
                 "salt": base64.b64encode(salt).decode(),
                 "check": base64.b64encode(cipher.encrypt(_CANARY)).decode(),
             }
-            with open(META_FILE, "w", encoding="utf-8") as f:
-                json.dump(meta, f)
+            try:
+                with open(META_FILE, "w", encoding="utf-8") as f:
+                    json.dump(meta, f)
+            except OSError as exc:
+                raise CorruptVault(str(exc)) from exc
             secure_chmod(META_FILE)
 
         self.cipher = cipher
@@ -182,18 +202,18 @@ class PasswordVault:
 
     def get_credentials_for_url(self, url):
         """
-        Kayıtlı 'site' alanı ile ziyaret edilen sayfanın domain'ini TAM ya da
-        alt-domain olarak karşılaştırır (eskiden substring aramasıydı, bu
-        phishing sitelerine kimlik bilgisi sızdırma riski taşıyordu).
+        Kayıtlı 'site' alanı ile ziyaret edilen sayfanın domain'ini birebir
+        (tam host) karşılaştırır. Alt-domain eşleşmesi BİLER yapılır:
+        "example.com" kaydı, "evil.example.com" adresine otomatik
+        doldurulmaz — eski endswith() yaklaşımı, ele geçirilmiş/low-trust bir
+        alt-domain'in ana domainin şifresini süzmesine izin veriyordu (ana
+        tarayıcıların hepsi tam host eşleştirmesi yapar).
         """
         target = self._netloc(urlparse(url).netloc or url)
         if not target:
             return None
         for entry in self.get_all_entries():
-            site_netloc = self._netloc(entry.get("site", ""))
-            if not site_netloc:
-                continue
-            if target == site_netloc or target.endswith("." + site_netloc):
+            if self._netloc(entry.get("site", "")) == target:
                 return entry
         return None
 
@@ -302,7 +322,10 @@ class PasswordManagerDialog(QDialog):
         self.resize(650, 400)
         self.setStyleSheet("QDialog { background-color: #1a1a1a; color: #ffffff; } QTableWidget { background-color: #242424; color: #ffffff; border: 1px solid #333333; } QHeaderView::section { background-color: #2a2a2a; color: #3daee9; padding: 4px; border: 1px solid #333333; } QPushButton { background-color: #2a2a2a; color: #ffffff; border: 1px solid #333333; padding: 6px 12px; border-radius: 4px; } QPushButton:hover { background-color: #3b3b3b; border: 1px solid #3daee9; } QMenu { background-color: #242424; color: #ffffff; border: 1px solid #333333; } QMenu::item:selected { background-color: #3daee9; }")
 
-        self.layout = QVBoxLayout(self)
+        # NOT: Qt QWidget.zaten bir layout() metodu sağlar; self.layout'a
+        # yazmak onu gölgeler. Qt'nin kendi metoduyla çakışmasın diye
+        # main_layout kullanılıyor.
+        self.main_layout = QVBoxLayout(self)
         self.table = QTableWidget(0, 3)
         headers = ["Site / Domain", "Kullanıcı Adı", "Şifre"] if self.lang == "tr" else ["Site / Domain", "Username", "Password"]
         self.table.setHorizontalHeaderLabels(headers)
@@ -311,7 +334,7 @@ class PasswordManagerDialog(QDialog):
         self.table.customContextMenuRequested.connect(self._show_context_menu)
         self._populating = False
         self.table.itemChanged.connect(self._on_item_changed)
-        self.layout.addWidget(self.table)
+        self.main_layout.addWidget(self.table)
 
         btn_layout = QHBoxLayout()
         self.btn_add = QPushButton("Yeni Ekle" if self.lang == "tr" else "Add New")
@@ -328,7 +351,7 @@ class PasswordManagerDialog(QDialog):
         btn_layout.addStretch()
         btn_layout.addWidget(self.btn_import)
         btn_layout.addWidget(self.btn_export)
-        self.layout.addLayout(btn_layout)
+        self.main_layout.addLayout(btn_layout)
         self.refresh_table()
 
     def refresh_table(self):
@@ -514,12 +537,44 @@ class PasswordManagerDialog(QDialog):
 
     def import_csv(self):
         path, _ = QFileDialog.getOpenFileName(self, "CSV Seç" if self.lang == "tr" else "Select CSV", "", "CSV Files (*.csv)")
-        if path:
-            batch_data = []
-            with open(path, 'r', encoding='utf-8') as f:
+        if not path:
+            return
+
+        batch_data = []
+        try:
+            # encoding='utf-8-sig': Chrome/Brave'in dışa aktardığı CSV
+            # dosyaları genelde bir UTF-8 BOM ile başlar; düz 'utf-8' bu
+            # BOM'u ilk sütun adının (ör. "name") başına eklenmiş bir
+            # karakter olarak bırakıp o sütunun hiç bulunamamasına yol
+            # açıyordu.
+            with open(path, 'r', encoding='utf-8-sig', newline='') as f:
                 for row in csv.DictReader(f):
-                    site, user, pwd = row.get("site", "").strip(), row.get("username", "").strip(), row.get("password", "").strip()
-                    if site and user: batch_data.append((site, user, pwd))
-            if batch_data:
-                self.vault.add_entries_bulk(batch_data)
-                self.refresh_table()
+                    # Farklı tarayıcılar farklı sütun adları kullanır:
+                    # GEM'in kendi dışa aktarımı: "site", "username", "password"
+                    # Chrome/Brave/Edge dışa aktarımı: "name", "url", "username", "password", "note"
+                    # "url" tercih edilir (tam login adresini içerir; domain
+                    # eşleştirmesi get_credentials_for_url() içinde zaten
+                    # normalize ediliyor), yoksa "site"/"name"'e düşülür.
+                    site = (row.get("url") or row.get("site") or row.get("name") or "").strip()
+                    user = (row.get("username") or row.get("login") or row.get("login_username") or "").strip()
+                    pwd = (row.get("password") or row.get("login_password") or "").strip()
+                    if site and user:
+                        batch_data.append((site, user, pwd))
+        except Exception:
+            err = "CSV dosyası okunamadı." if self.lang == "tr" else "Could not read the CSV file."
+            show_modern_info(self, err, lang=self.lang, warning=True)
+            return
+
+        if batch_data:
+            self.vault.add_entries_bulk(batch_data)
+            self.refresh_table()
+            done = (f"{len(batch_data)} şifre içe aktarıldı." if self.lang == "tr"
+                    else f"{len(batch_data)} passwords imported.")
+            show_modern_info(self, done, lang=self.lang)
+        else:
+            empty = (
+                "CSV dosyasında içe aktarılabilecek geçerli bir kayıt bulunamadı."
+                if self.lang == "tr" else
+                "No valid entries were found in the CSV file to import."
+            )
+            show_modern_info(self, empty, lang=self.lang, warning=True)

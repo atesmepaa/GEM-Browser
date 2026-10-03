@@ -1,45 +1,78 @@
 import os
 import json
-import shutil
 import subprocess
 from PyQt6.QtNetwork import QNetworkProxy
-from urllib.parse import parse_qs, urlparse, quote_plus
+from urllib.parse import parse_qs, urlparse
 from PyQt6.QtWidgets import (
-    QMainWindow, QTabWidget, QTabBar, QVBoxLayout, QWidget,
-    QLineEdit, QToolBar, QToolButton, QMenu, QDialog,
-    QListWidget, QListWidgetItem, QLabel, QCheckBox, QPushButton, QHBoxLayout, QComboBox,
-    QStyle, QProxyStyle, QColorDialog, QFileDialog, QApplication,
-    QScrollArea, QFrame
+    QMainWindow, QTabWidget, QTabBar, QVBoxLayout, QHBoxLayout, QWidget,
+    QLabel, QLineEdit, QToolBar, QToolButton, QMenu, QDialog, QApplication,
+    QFileDialog
 )
 from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEngineScript, QWebEngineSettings, QWebEnginePage
-from PyQt6.QtCore import QUrl, Qt, QTimer, QThread, pyqtSignal, QSize, QPoint, QVariantAnimation, QEasingCurve, QEvent
-from PyQt6.QtGui import QAction, QIcon, QKeySequence, QPainter, QColor, QPixmap
+from PyQt6.QtCore import QUrl, Qt, QTimer, QThread, pyqtSignal, QSize, QEvent
+from PyQt6.QtGui import QAction, QIcon, QKeySequence, QColor, QPixmap
+try:
+    from PyQt6.QtPrintSupport import QPrinter, QPrintDialog
+except ImportError:
+    QPrinter = QPrintDialog = None  # çok nadir: QtPrintSupport paketi yok
 
 from gem_browser import icons as gem_icons
 from gem_browser.tor_vpn import TorVpnManager
 from gem_browser.url_suggestions import gather_local_suggestions, RemoteSuggester, SuggestionPopup
 from gem_browser.browser_tab import BrowserTab
-from gem_browser.router import resolve_url
+from gem_browser.router import resolve_url, build_search_url, search_engine_label
 from gem_browser.new_tab import get_new_tab_url, load_bookmarks, save_bookmarks
 from gem_browser.adblock import AdblockInterceptor
 from gem_browser import filter_lists
 from gem_browser.password_manager import (
     PasswordVault, PasswordManagerDialog, MasterPasswordDialog,
-    WrongMasterPassword, vault_exists
+    WrongMasterPassword, CorruptVault, vault_exists
 )
 from gem_browser.settings import BrowserSettings
 from gem_browser.downloads import DownloadManager
 from gem_browser.downloads_dialog import DownloadsDialog
 from gem_browser import paths as gem_paths
+from gem_browser import pdf_viewer
 from gem_browser.modern_popup import show_modern_info, show_modern_confirm
 from gem_browser import history as gem_history
 from gem_browser import default_browser as gem_default_browser
 from gem_browser import theme as gem_theme
 from gem_browser import session as gem_session
+from gem_browser.tab_widgets import (
+    _LeftAlignedTabStyle, _PlusToolButton, _TabPreviewPopup, ProgressTabBar,
+    _CollapsibleSidebar, _SidebarTabRow, BookmarkDialog, TabSearchDialog,
+)
+from gem_browser.settings_dialog import SettingsDialog, ClearDataDialog
+from gem_browser.history_dialog import HistoryDialog
 
 _active_windows = []
+# downloadRequested sinyalinin bağlandığı profiller: aynı paylaşılan profile
+# N pencere de bağlanırsa tek indirme isteği N kez işlenir ve N ayrı "Dosyayı
+# Kaydet" diyaloğu açılır. Her profile yalnızca İLK pencere bağlanır; o
+# pencere kapanırsa (bkz. closeEvent) bağlantı aynı profili kullanan başka
+# bir pencereye devredilir.
+_download_connected_profiles = []
 _startup_session_checked = False
 _normal_profile = None
+
+
+def _is_gem_internal_page(url_str: str) -> bool:
+    """Uygulamanın kendi ürettiği geçici sayfalar (yeni sekme sayfası,
+    PDF.js görüntüleyici). Bunlar oturuma/geçmişe yazılmaz, adres
+    çubuğunda gösterilmez, favorilenemez."""
+    if not url_str.startswith("file://"):
+        return False
+    return ("gem_browser_new_tab" in url_str) or ("gem_pdf_viewer_" in url_str)
+
+
+def _transparent_icon(w: int, h: int) -> QIcon:
+    """Şeffaf dolgu ikonu: QLineEdit aksiyon ikonları alana yapışık
+    çizildiğinden, kenarlardan içeride durmaları için boşluk aksiyonu."""
+    pm = QPixmap(w, h)
+    pm.fill(Qt.GlobalColor.transparent)
+    icon = QIcon()
+    icon.addPixmap(pm)
+    return icon
 
 def _get_shared_normal_profile() -> QWebEngineProfile:
     global _normal_profile
@@ -76,8 +109,13 @@ def _load_app_icon(accent_color: str = None) -> QIcon:
             if not source.isNull():
                 for size in _ICON_SIZES:
                     icon.addPixmap(source.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-    
-    _logo_icon_cache[cache_key] = icon
+
+    # Only cache a successfully produced icon. If the logo couldn't be
+    # loaded/tinted this time (e.g. file not ready yet, transient I/O
+    # error), leave the cache empty so the NEXT call retries from scratch
+    # instead of permanently freezing an empty QIcon for this accent color.
+    if not icon.isNull():
+        _logo_icon_cache[cache_key] = icon
     return icon
 
 DARK_STYLE = """
@@ -173,811 +211,80 @@ class BlocklistUpdateThread(QThread):
         except Exception as e:
             self.finished_err.emit(str(e))
 
-class _LeftAlignedTabStyle(QProxyStyle):
-    def drawItemText(self, painter, rect, flags, pal, enabled, text, textRole=None):
-        flags &= ~int(Qt.AlignmentFlag.AlignHCenter)
-        flags &= ~int(Qt.AlignmentFlag.AlignRight)
-        flags |= int(Qt.AlignmentFlag.AlignLeft)
-        if textRole is None: super().drawItemText(painter, rect, flags, pal, enabled, text)
-        else: super().drawItemText(painter, rect, flags, pal, enabled, text, textRole)
+class PdfFetchThread(QThread):
+    """Uzak PDF'i Qt tarafında (CORS'suz) sessizce indirip yerel kopyanın
+    yolunu bildirir; görüntüleyici file:// üzerinden açar."""
+    done_ok = pyqtSignal(str, str)  # kaynak url, yerel yol
+    done_err = pyqtSignal(str, str)  # kaynak url, hata
 
-class _PlusToolButton(QToolButton):
-    def __init__(self, parent=None):
+    def __init__(self, url: str, parent=None):
         super().__init__(parent)
-        self._plus_color = QColor("#3daee9")
+        self._url = url
 
-    def setPlusColor(self, color: str):
-        self._plus_color = QColor(color)
-        self.update()
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = painter.pen()
-        pen.setColor(self._plus_color)
-        pen.setWidthF(2.0)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(pen)
-        cx, cy = self.width() / 2.0, self.height() / 2.0
-        half = 5.0
-        painter.drawLine(int(cx - half), int(cy), int(cx + half), int(cy))
-        painter.drawLine(int(cx), int(cy - half), int(cx), int(cy + half))
-        painter.end()
-
-_PREVIEW_THUMB_W = 220
-_PREVIEW_THUMB_H = 124
-
-class _TabPreviewPopup(QWidget):
-    def __init__(self):
-        super().__init__(None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-
-        self._card = QWidget(self)
-        self._card.setObjectName("gemTabPreviewCard")
-        self._card.setStyleSheet(
-            "#gemTabPreviewCard { background-color: #242424; border: 1px solid #3a3a3a; border-radius: 8px; }"
-        )
-        card_layout = QVBoxLayout(self._card)
-        card_layout.setContentsMargins(8, 8, 8, 10)
-        card_layout.setSpacing(6)
-
-        self._thumb_label = QLabel(self._card)
-        self._thumb_label.setFixedSize(_PREVIEW_THUMB_W, _PREVIEW_THUMB_H)
-        self._thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._thumb_label.setWordWrap(True)
-        self._thumb_label.setStyleSheet(
-            "background-color: #1a1a1a; border: 1px solid #333333; border-radius: 6px; color: #777777; font-size: 11px;"
-        )
-
-        self._title_label = QLabel(self._card)
-        self._title_label.setStyleSheet("color: #eeeeee; font-size: 13px; font-weight: 500; background: transparent;")
-
-        self._status_label = QLabel(self._card)
-        self._status_label.setStyleSheet("color: #a0a0a0; font-size: 11px; font-style: italic; background: transparent;")
-        self._status_label.hide()
-        
-        # YENİ: Başlık ve durum yazısını yan yana dizmek için yatay layout
-        title_layout = QHBoxLayout()
-        title_layout.setContentsMargins(0, 0, 0, 0)
-        title_layout.setSpacing(6)
-        title_layout.addWidget(self._title_label)
-        title_layout.addWidget(self._status_label)
-        title_layout.addStretch() # Sola yasla
-
-        card_layout.addWidget(self._thumb_label)
-        card_layout.addLayout(title_layout) # Alt alta yerine yan yana layout'u ekle
-        outer.addWidget(self._card)
-
-    def show_for(self, tab, title: str, anchor_global_pos: QPoint, is_sidebar: bool = False):
-        lang = getattr(tab, "lang", "tr") if tab is not None else "tr"
-        is_suspended = bool(getattr(tab, "is_suspended", False))
-        thumbnail = tab.get_thumbnail() if tab is not None and hasattr(tab, "get_thumbnail") else None
-
-        # Önizleme Görselini Ayarlama (Kırpma düzeltmesi dahil)
-        if thumbnail is not None and not thumbnail.isNull():
-            scaled = thumbnail.scaled(
-                _PREVIEW_THUMB_W, _PREVIEW_THUMB_H,
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation
-            )
-            x = max(0, (scaled.width() - _PREVIEW_THUMB_W) // 2)
-            y = 0 
-            self._thumb_label.setPixmap(scaled.copy(x, y, _PREVIEW_THUMB_W, _PREVIEW_THUMB_H))
-        else:
-            self._thumb_label.setPixmap(QPixmap())
-            if is_suspended:
-                self._thumb_label.setText("💤 " + ("Uykuda" if lang == "tr" else "Sleeping"))
-            elif tab is not None and hasattr(tab, "is_page_loading") and tab.is_page_loading():
-                self._thumb_label.setText("Yükleniyor..." if lang == "tr" else "Loading...")
-            else:
-                self._thumb_label.setText("Önizleme yok" if lang == "tr" else "No preview yet")
-
-        # Durum Yazısını Güncelleme ve Başlık Genişliğini Ayarlama
-        if is_suspended and thumbnail is not None and not thumbnail.isNull():
-            self._status_label.setText("💤 " + ("Uykuda" if lang == "tr" else "Sleeping"))
-            self._status_label.show()
-            available_w = _PREVIEW_THUMB_W - 65 # Uykuda yazısı için boşluk bırak
-        else:
-            self._status_label.hide()
-            available_w = _PREVIEW_THUMB_W - 4
-
-        fm = self._title_label.fontMetrics()
-        self._title_label.setText(fm.elidedText(title or "", Qt.TextElideMode.ElideRight, available_w))
-
-        self.adjustSize()
-        
-        screen = QApplication.primaryScreen()
-        geo = screen.availableGeometry() if screen else self.screen().availableGeometry()
-        
-        if is_sidebar:
-            x = anchor_global_pos.x() + 8
-            y = anchor_global_pos.y() - self.height() // 2
-        else:
-            x = anchor_global_pos.x() - self.width() // 2
-            y = anchor_global_pos.y()
-            
-        x = max(geo.left() + 4, min(x, geo.right() - self.width() - 4))
-        if y + self.height() > geo.bottom():
-            y = anchor_global_pos.y() - self.height() - 40
-            
-        self.move(max(0, x), max(0, y))
-        self.show()
-
-class ProgressTabBar(QTabBar):
-    _ANIM_IN_MS = 170
-    _ANIM_OUT_MS = 130
-    _MIN_TAB_WIDTH = 84
-    _MAX_TAB_WIDTH = 200
-    _PINNED_TAB_WIDTH = 40
-    _BTN_RESERVED = 34 
-    pin_toggle_requested = pyqtSignal(object) 
-
-    def __init__(self, tab_widget, parent=None):
-        super().__init__(parent)
-        self.tab_widget_ref = tab_widget
-        self.progress_map = {}
-        self.accent_color = "#3daee9"
-        self._anim_scale = {}
-        self._anims = {}
-        self.tabMoved.connect(lambda *_: self._update_btn_pos())
-
-        self.setMouseTracking(True)
-        self._hover_index = -1
-        self._hover_timer = QTimer(self)
-        self._hover_timer.setSingleShot(True)
-        self._hover_timer.setInterval(450)
-        self._hover_timer.timeout.connect(self._show_hover_preview)
-
-    def set_accent_color(self, color: str):
-        self.accent_color = color or "#3daee9"
-        self.update()
-
-    def set_progress(self, widget, value):
-        if value is None: self.progress_map.pop(widget, None)
-        else: self.progress_map[widget] = value
-        self.update()
-
-    def tabSizeHint(self, index):
-        size = super().tabSizeHint(index)
-        widget = self.tab_widget_ref.widget(index)
-        scale = self._anim_scale.get(widget, 1.0)
-        pinned = bool(widget.property("pinned")) if widget is not None else False
-
-        count = self.count()
-        if pinned:
-            width = self._PINNED_TAB_WIDTH
-        elif count > 0 and self.width() > 0:
-            pinned_count = sum(1 for i in range(count) if bool(self.tab_widget_ref.widget(i).property("pinned")))
-            normal_count = max(1, count - pinned_count)
-            reserved = self._BTN_RESERVED + pinned_count * self._PINNED_TAB_WIDTH
-            available = max(0, self.width() - reserved)
-            ideal = available // normal_count
-            width = max(self._MIN_TAB_WIDTH, min(self._MAX_TAB_WIDTH, ideal))
-        else:
-            width = size.width()
-
-        if scale < 1.0:
-            width = max(1, int(width * scale))
-        return QSize(width, size.height())
-
-    def _relayout(self):
-        app = QApplication.instance()
-        if app is not None: app.sendEvent(self, QEvent(QEvent.Type.StyleChange))
-        else: self.update()
-        self._update_btn_pos()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._update_btn_pos()
-
-    def tabLayoutChange(self):
-        super().tabLayoutChange()
-        self._update_btn_pos()
-
-    def _update_btn_pos(self):
-        if not (hasattr(self, 'new_tab_btn') and self.new_tab_btn): return
-        btn_w, btn_h = self.new_tab_btn.width(), self.new_tab_btn.height()
-        if self.count() > 0:
-            rect = self.tabRect(self.count() - 1)
-            y = rect.top() + (rect.height() - btn_h) // 2
-            x = rect.right() + 6
-        else:
-            x, y = 6, (self.height() - btn_h) // 2
-        max_x = max(0, self.width() - btn_w - 6)
-        self.new_tab_btn.move(min(x, max_x), max(0, y))
-        self.new_tab_btn.raise_()
-
-    def animate_tab_in(self, widget):
-        old = self._anims.pop(widget, None)
-        if old is not None: old.stop()
-        self._anim_scale[widget] = 0.0
-        self._relayout()
-
-        anim = QVariantAnimation(self)
-        anim.setStartValue(0.0)
-        anim.setEndValue(1.0)
-        anim.setDuration(self._ANIM_IN_MS)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-        def _step(value, w=widget):
-            self._anim_scale[w] = value
-            self._relayout()
-        def _done(w=widget):
-            self._anim_scale.pop(w, None)
-            self._anims.pop(w, None)
-            self._relayout()
-
-        anim.valueChanged.connect(_step)
-        anim.finished.connect(_done)
-        self._anims[widget] = anim
-        anim.start()
-
-    def animate_tab_out(self, widget, on_finished):
-        old = self._anims.pop(widget, None)
-        if old is not None: old.stop()
-
-        anim = QVariantAnimation(self)
-        anim.setStartValue(self._anim_scale.get(widget, 1.0))
-        anim.setEndValue(0.0)
-        anim.setDuration(self._ANIM_OUT_MS)
-        anim.setEasingCurve(QEasingCurve.Type.InCubic)
-
-        def _step(value, w=widget):
-            self._anim_scale[w] = value
-            self._relayout()
-        def _done(w=widget):
-            self._anim_scale.pop(w, None)
-            self._anims.pop(w, None)
-            on_finished()
-
-        anim.valueChanged.connect(_step)
-        anim.finished.connect(_done)
-        self._anims[widget] = anim
-        anim.start()
-
-    def mouseMoveEvent(self, event):
-        super().mouseMoveEvent(event)
-        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
-        index = self.tabAt(pos)
-        if index != self._hover_index:
-            self._hover_index = index
-            self._hide_hover_preview()
-            if index != -1: self._hover_timer.start()
-
-    def leaveEvent(self, event):
-        super().leaveEvent(event)
-        self._hover_index = -1
-        self._hover_timer.stop()
-        self._hide_hover_preview()
-
-    def mousePressEvent(self, event):
-        self._hover_timer.stop()
-        self._hide_hover_preview()
-        super().mousePressEvent(event)
-
-    def _show_hover_preview(self):
-        if self._hover_index == -1 or self._hover_index >= self.count(): return
-        
-        # YENİ EKLENEN SATIR: Eğer üzerine gelinen sekme zaten açık olan (aktif) sekme ise hiçbir şey yapma
-        if self._hover_index == self.currentIndex(): return
-        
-        widget = self.tab_widget_ref.widget(self._hover_index)
-        main_win = self.tab_widget_ref.window()
-        if widget is None or not hasattr(main_win, "show_hover_preview"): return
-        
-        title = getattr(widget, "_gem_full_title", None) or self.tabToolTip(self._hover_index) or self.tabText(self._hover_index)
-        rect = self.tabRect(self._hover_index)
-        anchor = self.mapToGlobal(QPoint(rect.center().x(), rect.bottom() + 8))
-        main_win.show_hover_preview(widget, title, anchor, is_sidebar=False)
-
-    def _hide_hover_preview(self):
-        main_win = self.tab_widget_ref.window()
-        if hasattr(main_win, "hide_hover_preview"):
-            main_win.hide_hover_preview()
-
-    def contextMenuEvent(self, event):
-        index = self.tabAt(event.pos())
-        if index == -1: return
-        widget = self.tab_widget_ref.widget(index)
-        main_win = self.tab_widget_ref.window()
-        lang = getattr(main_win, "lang", "tr")
-        pinned = bool(widget.property("pinned")) if widget is not None else False
-
-        menu = QMenu(self)
-        pin_action = menu.addAction(("Sabitlemeyi Kaldır" if pinned else "Sekmeyi Sabitle") if lang == "tr" else ("Unpin Tab" if pinned else "Pin Tab"))
-        menu.addSeparator()
-        close_action = menu.addAction("Sekmeyi Kapat" if lang == "tr" else "Close Tab")
-
-        chosen = menu.exec(event.globalPos())
-        if chosen == pin_action: self.pin_toggle_requested.emit(widget)
-        elif chosen == close_action and hasattr(main_win, "close_tab"): main_win.close_tab(index)
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self.progress_map: return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        bar_color = QColor(self.accent_color)
-        bar_height = 3
-
-        for index in range(self.count()):
-            widget = self.tab_widget_ref.widget(index)
-            pct = self.progress_map.get(widget)
-            if pct is not None:
-                rect = self.tabRect(index)
-                bar_y = rect.bottom() - bar_height
-                bar_width = max(2, int(rect.width() * (pct / 100.0)))
-                painter.fillRect(rect.x(), bar_y, bar_width, bar_height, bar_color)
-        painter.end()
-
-class _CollapsibleSidebar(QScrollArea):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWidgetResizable(True)
-        self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        
-        self._expanded_width = 230
-        self._collapsed_width = 10 
-        self.setFixedWidth(self._collapsed_width)
-        self.setMouseTracking(True)
-        
-        self.anim = QVariantAnimation(self)
-        self.anim.setDuration(120)
-        self.anim.setEasingCurve(QEasingCurve.Type.OutQuad)
-        self.anim.valueChanged.connect(self.setFixedWidth)
-
-    def enterEvent(self, event):
-        self.anim.stop()
-        self.anim.setStartValue(self.width())
-        self.anim.setEndValue(self._expanded_width)
-        self.anim.start()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self.anim.stop()
-        self.anim.setStartValue(self.width())
-        self.anim.setEndValue(self._collapsed_width)
-        self.anim.start()
-        super().leaveEvent(event)
-
-class _SidebarTabRow(QWidget):
-    activated = pyqtSignal()
-    close_requested = pyqtSignal()
-    pin_toggle_requested = pyqtSignal()
-
-    def __init__(self, tab, title: str, icon, pinned: bool, selected: bool, is_light: bool, lang: str = "tr", parent=None):
-        super().__init__(parent)
-        self._tab = tab
-        self._title = title
-        self._pinned = pinned
-        self._lang = lang
-        self.setFixedHeight(34)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 4, 6, 4)
-        layout.setSpacing(8)
-
-        icon_label = QLabel(self)
-        icon_label.setFixedSize(16, 16)
-        if icon is not None and not icon.isNull():
-            icon_label.setPixmap(icon.pixmap(16, 16))
-        layout.addWidget(icon_label)
-
-        if not pinned:
-            title_label = QLabel(self)
-            text_col = ("#000000" if is_light else "#ffffff") if selected else ("#666666" if is_light else "#a0a0a0")
-            title_label.setStyleSheet(
-                f"color: {text_col}; font-size: 13px; "
-                f"font-weight: {'600' if selected else '500'}; background: transparent;"
-            )
-            fm = title_label.fontMetrics()
-            title_label.setText(fm.elidedText(title or "", Qt.TextElideMode.ElideRight, 125))
-            layout.addWidget(title_label, 1)
-
-            close_btn = QToolButton(self)
-            close_btn.setText("×")
-            close_btn.setFixedSize(20, 20)
-            close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            close_btn.setStyleSheet(
-                "QToolButton { background: transparent; border: none; border-radius: 6px; "
-                "color: #888888; font-size: 14px; } "
-                "QToolButton:hover { background-color: rgba(255, 85, 85, 0.18); color: #ff5555; }"
-            )
-            close_btn.clicked.connect(self.close_requested.emit)
-            layout.addWidget(close_btn)
-        else:
-            layout.addStretch(1)
-
-        bg = ("#e6e6e6" if is_light else "#3b3b3b") if selected else "transparent"
-        self.setObjectName("gemSidebarRow")
-        self.setStyleSheet(f"#gemSidebarRow {{ background-color: {bg}; border-radius: 8px; }}")
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton: self.activated.emit()
-        super().mousePressEvent(event)
-
-    def contextMenuEvent(self, event):
-        menu = QMenu(self)
-        pin_action = menu.addAction(("Sabitlemeyi Kaldır" if self._pinned else "Sekmeyi Sabitle") if self._lang == "tr" else ("Unpin Tab" if self._pinned else "Pin Tab"))
-        menu.addSeparator()
-        close_action = menu.addAction("Sekmeyi Kapat" if self._lang == "tr" else "Close Tab")
-        chosen = menu.exec(event.globalPos())
-        if chosen == pin_action: self.pin_toggle_requested.emit()
-        elif chosen == close_action: self.close_requested.emit()
-
-    def enterEvent(self, event):
-        main_win = self.window()
-        
-        if hasattr(main_win, "current_tab") and main_win.current_tab() == self._tab:
-            super().enterEvent(event)
-            return
-        
-        if hasattr(main_win, "show_hover_preview"):
-            rect = self.rect()
-            pos = self.mapToGlobal(QPoint(rect.right() + 4, rect.center().y()))
-            main_win.show_hover_preview(self._tab, self._title, pos, is_sidebar=True)
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        main_win = self.window()
-        if hasattr(main_win, "hide_hover_preview"):
-            main_win.hide_hover_preview()
-        super().leaveEvent(event)
-
-class BookmarkDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        lang = parent.lang if parent else "tr"
-        self.setWindowTitle("Favori Ekle" if lang == "tr" else "Add Bookmark")
-        self.resize(320, 160)
-        layout = QVBoxLayout(self)
-
-        self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("Site Adı" if lang == "tr" else "Site Name")
-        layout.addWidget(self.name_input)
-
-        self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("URL (örn: https://...)" if lang == "tr" else "URL (e.g. https://...)")
-        layout.addWidget(self.url_input)
-
-        btn_layout = QHBoxLayout()
-        add_btn = QPushButton("Ekle" if lang == "tr" else "Add")
-        add_btn.clicked.connect(self.accept)
-        cancel_btn = QPushButton("İptal" if lang == "tr" else "Cancel")
-        cancel_btn.clicked.connect(self.reject)
-
-        btn_layout.addWidget(add_btn)
-        btn_layout.addWidget(cancel_btn)
-        layout.addLayout(btn_layout)
-
-    def get_data(self):
-        return self.name_input.text().strip(), self.url_input.text().strip()
-
-class HistoryDialog(QDialog):
-    def __init__(self, history_entries, lang="tr", parent=None):
-        super().__init__(parent)
-        self.lang = lang
-        self.parent_window = parent
-        self.setWindowTitle("Geçmiş" if lang == "tr" else "History")
-        self.resize(560, 420)
-        layout = QVBoxLayout(self)
-        
-        layout.addWidget(QLabel("Ziyaret edilen siteler (çift tıkla: aç):" if lang == "tr" else "Visited sites (double-click to open):"))
-        self.list_widget = QListWidget()
-        self.list_widget.itemDoubleClicked.connect(self._open_selected)
-        self._populate(history_entries)
-        layout.addWidget(self.list_widget)
-
-        btn_row = QHBoxLayout()
-        clear_btn = QPushButton("Geçmişi Temizle" if lang == "tr" else "Clear History")
-        clear_btn.clicked.connect(self._clear_history)
-        btn_row.addWidget(clear_btn)
-        btn_row.addStretch()
-        close_btn = QPushButton("Kapat" if lang == "tr" else "Close")
-        close_btn.clicked.connect(self.accept)
-        btn_row.addWidget(close_btn)
-        layout.addLayout(btn_row)
-
-    def _populate(self, history_entries):
-        self.list_widget.clear()
-        if not history_entries:
-            self.list_widget.addItem("Henüz gezinme geçmişi yok." if self.lang == "tr" else "No browsing history yet.")
-            return
-        for entry in reversed(history_entries):
-            url, title = entry.get("url", ""), entry.get("title") or entry.get("url", "")
-            display = url if title == url else f"{title}  —  {url}"
-            item = QListWidgetItem(display)
-            item.setData(Qt.ItemDataRole.UserRole, url)
-            self.list_widget.addItem(item)
-
-    def _open_selected(self, item):
-        url = item.data(Qt.ItemDataRole.UserRole)
-        if url and self.parent_window is not None:
-            self.parent_window.add_new_tab(QUrl(url))
-        self.accept()
-
-    def _clear_history(self):
-        msg = "Tüm gezinme geçmişi kalıcı olarak silinsin mi?" if self.lang == "tr" else "Permanently delete all browsing history?"
-        title = "Geçmişi Temizle" if self.lang == "tr" else "Clear History"
-        if show_modern_confirm(self, msg, title=title, lang=self.lang, danger=True):
-            gem_history.clear_history()
-            if self.parent_window is not None:
-                self.parent_window.persistent_history = []
-                self.parent_window.session_history = []
-            self._populate([])
-
-class SettingsDialog(QDialog):
-    def __init__(self, settings_manager, parent=None):
-        super().__init__(parent)
-        self.settings_manager = settings_manager
-        lang = self.settings_manager.current["language"]
-
-        self._pending_accent = self.settings_manager.current.get("accent_color", "")
-        self._pending_bg_path = self.settings_manager.current.get("new_tab_background", "")
-
-        self.setWindowTitle("Ayarlar" if lang == "tr" else "Settings")
-        self.resize(480, 580)
-        self.setMinimumSize(460, 320)
-
-        outer_layout = QVBoxLayout(self)
-        outer_layout.setContentsMargins(0, 0, 0, 0)
-        outer_layout.setSpacing(0)
-
-        scroll_area = QScrollArea(self)
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        outer_layout.addWidget(scroll_area, 1)
-
-        scroll_content = QWidget()
-        scroll_area.setWidget(scroll_content)
-        layout = QVBoxLayout(scroll_content)
-        layout.setContentsMargins(12, 12, 12, 12)
-        
-        lang_layout = QHBoxLayout()
-        lang_layout.addWidget(QLabel("Dil:" if lang == "tr" else "Language:"))
-        self.combo_lang = QComboBox()
-        self.combo_lang.addItems(["Türkçe", "English"])
-        self.combo_lang.setCurrentIndex(0 if lang == "tr" else 1)
-        lang_layout.addWidget(self.combo_lang)
-        layout.addLayout(lang_layout)
-
-        theme_layout = QHBoxLayout()
-        theme_layout.addWidget(QLabel("Tema:" if lang == "tr" else "Theme:"))
-        self.combo_theme = QComboBox()
-        self.combo_theme.addItems(["Koyu", "Açık"] if lang == "tr" else ["Dark", "Light"])
-        self.combo_theme.setCurrentIndex(1 if self.settings_manager.current["ui_theme"] == "light" else 0)
-        theme_layout.addWidget(self.combo_theme)
-        layout.addLayout(theme_layout)
-
-        accent_layout = QHBoxLayout()
-        accent_layout.addWidget(QLabel("Vurgu Rengi:" if lang == "tr" else "Accent Color:"))
-        self.accent_swatch_btn = QPushButton()
-        self.accent_swatch_btn.setFixedSize(28, 28)
-        self.accent_swatch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.accent_swatch_btn.clicked.connect(self._pick_accent_color)
-        accent_layout.addWidget(self.accent_swatch_btn)
-        
-        accent_reset_btn = QPushButton("Varsayılana Döndür" if lang == "tr" else "Reset to Default")
-        accent_reset_btn.clicked.connect(self._reset_accent_color)
-        accent_layout.addWidget(accent_reset_btn)
-        accent_layout.addStretch()
-        layout.addLayout(accent_layout)
-        self._refresh_accent_swatch()
-        self.combo_theme.currentIndexChanged.connect(self._refresh_accent_swatch)
-
-        bg_layout = QHBoxLayout()
-        bg_layout.addWidget(QLabel("Yeni Sekme Arkaplanı:" if lang == "tr" else "New Tab Background:"))
-        bg_pick_btn = QPushButton("Resim Seç..." if lang == "tr" else "Choose Image...")
-        bg_pick_btn.clicked.connect(self._pick_new_tab_background)
-        bg_layout.addWidget(bg_pick_btn)
-        
-        bg_reset_btn = QPushButton("Varsayılana Döndür" if lang == "tr" else "Reset to Default")
-        bg_reset_btn.clicked.connect(self._reset_new_tab_background)
-        bg_layout.addWidget(bg_reset_btn)
-        bg_layout.addStretch()
-        layout.addLayout(bg_layout)
-
-        self.bg_status_label = QLabel()
-        self.bg_status_label.setStyleSheet("color: #888888; font-size: 11px;")
-        layout.addWidget(self.bg_status_label)
-        self._refresh_bg_status_label()
-
-        self.chk_force_dark = QCheckBox("Koyu Temaya Zorla" if lang == "tr" else "Force Dark Mode")
-        self.chk_force_dark.setChecked(self.settings_manager.current["force_dark_web"])
-        layout.addWidget(self.chk_force_dark)
-
-        self.chk_adblock = QCheckBox("Reklam Engelleyici" if lang == "tr" else "AdBlocker")
-        self.chk_adblock.setChecked(self.settings_manager.current["adblock_enabled"])
-        layout.addWidget(self.chk_adblock)
-
-        self.chk_js = QCheckBox("JavaScript İzni" if lang == "tr" else "Enable JavaScript")
-        self.chk_js.setChecked(self.settings_manager.current["js_enabled"])
-        layout.addWidget(self.chk_js)
-        
-        self.chk_img = QCheckBox("Resimleri Yükle" if lang == "tr" else "Load Images")
-        self.chk_img.setChecked(self.settings_manager.current["load_images"])
-        layout.addWidget(self.chk_img)
-
-        self.chk_suggestions = QCheckBox("Adres Çubuğunda Arama Önerileri" if lang == "tr" else "Search Suggestions in Address Bar")
-        self.chk_suggestions.setChecked(self.settings_manager.current.get("search_suggestions", True))
-        layout.addWidget(self.chk_suggestions)
-
-        self.chk_auto_restore = QCheckBox("Sekmeleri Sormadan Otomatik Geri Yükle" if lang == "tr" else "Automatically Restore Tabs Without Asking")
-        self.chk_auto_restore.setChecked(self.settings_manager.current.get("auto_restore_tabs", False))
-        layout.addWidget(self.chk_auto_restore)
-        auto_restore_hint = QLabel(
-            "Açık iken, önceki oturumdan kalan sekmeler açılışta hiç sorulmadan otomatik geri yüklenir. Kapalıyken (varsayılan), her seferinde onay istenir."
-            if lang == "tr" else
-            "When on, tabs left open from the previous session are restored automatically on startup without asking. When off (default), you'll be asked each time."
-        )
-        auto_restore_hint.setWordWrap(True)
-        auto_restore_hint.setStyleSheet("color: #888888; font-size: 11px;")
-        layout.addWidget(auto_restore_hint)
-
-        self.chk_hw_accel = QCheckBox("Donanım Hızlandırmayı Kullan (GPU)" if lang == "tr" else "Use Hardware Acceleration (GPU)")
-        self.chk_hw_accel.setChecked(self.settings_manager.current.get("hardware_acceleration", True))
-        layout.addWidget(self.chk_hw_accel)
-        hw_hint = QLabel("Kapatmak RAM kullanımını azaltabilir ama sayfa render'ını yavaşlatabilir. Yeniden başlatma gerektirir." if lang == "tr" else "Turning this off may reduce RAM usage but slow rendering. Requires restart.")
-        hw_hint.setWordWrap(True)
-        hw_hint.setStyleSheet("color: #888888; font-size: 11px;")
-        layout.addWidget(hw_hint)
-
-        self.chk_low_ram = QCheckBox("Düşük RAM Modu (Agresif Tasarruf)" if lang == "tr" else "Low RAM Mode (Aggressive Savings)")
-        self.chk_low_ram.setChecked(self.settings_manager.current.get("low_ram_mode", False))
-        layout.addWidget(self.chk_low_ram)
-        
-        low_ram_hint = QLabel("RAM tüketimini 300MB'a çeker ancak çoklu sekme hızını düşürebilir. Yeniden başlatma gerektirir." if lang == "tr" else "Reduces RAM to ~300MB but may degrade multi-tab speed. Requires restart.")
-        low_ram_hint.setWordWrap(True)
-        low_ram_hint.setStyleSheet("color: #888888; font-size: 11px;")
-        layout.addWidget(low_ram_hint)
-        
-        # --- VPN AYARLARI ---
-        # Açıksa ve host/port boşsa: otomatik olarak resmi Tor ağına bağlanır
-        # (Brave/Opera'nın tek tıkla VPN deneyiminin ücretsiz eşdeğeri —
-        # detay için gem_browser/tor_vpn.py). Host/port doldurulursa,
-        # kullanıcının kendi SOCKS5 proxy'si (ör. ücretli bir VPN
-        # sağlayıcısının SOCKS adresi) kullanılır.
-        self.chk_vpn = QCheckBox("Yerleşik VPN (Tor — tek tıkla)" if lang == "tr" else "Built-in VPN (Tor — one click)")
-        self.chk_vpn.setChecked(self.settings_manager.current.get("vpn_enabled", False))
-        layout.addWidget(self.chk_vpn)
-
-        vpn_hint = QLabel(
-            "Alanları boş bırakırsanız otomatik olarak Tor ağı kullanılır "
-            "(bilgisayarınızda 'tor' kurulu olmalı). Kendi SOCKS5 proxy "
-            "adresinizi kullanmak isterseniz aşağıya girin."
-            if lang == "tr" else
-            "Leave the fields empty to automatically use the Tor network "
-            "('tor' must be installed). Enter your own SOCKS5 proxy address "
-            "below if you'd rather use that instead."
-        )
-        vpn_hint.setWordWrap(True)
-        vpn_hint.setStyleSheet("color: #888888; font-size: 11px;")
-        layout.addWidget(vpn_hint)
-
-        vpn_layout = QHBoxLayout()
-        self.vpn_host_input = QLineEdit()
-        self.vpn_host_input.setPlaceholderText("Gelişmiş: kendi SOCKS5 host'unuz (opsiyonel)" if lang == "tr" else "Advanced: your own SOCKS5 host (optional)")
-        self.vpn_host_input.setText(self.settings_manager.current.get("vpn_host", ""))
-
-        self.vpn_port_input = QLineEdit()
-        self.vpn_port_input.setPlaceholderText("Port (örn: 9050)")
-        self.vpn_port_input.setText(str(self.settings_manager.current.get("vpn_port", 9050)))
-
-        vpn_layout.addWidget(self.vpn_host_input)
-        vpn_layout.addWidget(self.vpn_port_input)
-        layout.addLayout(vpn_layout)
-
-        layout.addStretch()
-
-        save_btn = QPushButton("Kaydet" if lang == "tr" else "Save")
-        save_btn.setContentsMargins(0, 0, 0, 0)
-        save_btn.clicked.connect(self._save_and_close)
-        save_btn_wrapper = QWidget(self)
-        save_btn_layout = QVBoxLayout(save_btn_wrapper)
-        save_btn_layout.setContentsMargins(12, 10, 12, 12)
-        save_btn_layout.addWidget(save_btn)
-        outer_layout.addWidget(save_btn_wrapper, 0)
-
-    def _current_lang(self) -> str:
-        return self.settings_manager.current["language"]
-
-    def _refresh_accent_swatch(self):
-        preview = self._pending_accent or gem_theme.default_accent_for_theme("light" if self.combo_theme.currentIndex() == 1 else "dark")
-        self.accent_swatch_btn.setStyleSheet(f"QPushButton {{ background-color: {preview}; border: 1px solid rgba(128,128,128,0.4); border-radius: 6px; }}")
-
-    def _refresh_bg_status_label(self):
-        lang = self._current_lang()
-        if self._pending_bg_path and os.path.exists(self._pending_bg_path):
-            self.bg_status_label.setText(f"Seçili görsel: {os.path.basename(self._pending_bg_path)}" if lang == "tr" else f"Selected image: {os.path.basename(self._pending_bg_path)}")
-        else:
-            self.bg_status_label.setText("Varsayılan gradyan kullanılıyor." if lang == "tr" else "Using default gradient.")
-
-    def _pick_accent_color(self):
-        current = QColor(self._pending_accent or gem_theme.default_accent_for_theme("light" if self.combo_theme.currentIndex() == 1 else "dark"))
-        color = QColorDialog.getColor(current, self, "Vurgu Rengi Seç" if self._current_lang() == "tr" else "Choose Accent Color")
-        if color.isValid():
-            self._pending_accent = color.name()
-            self._refresh_accent_swatch()
-
-    def _reset_accent_color(self):
-        self._pending_accent = ""
-        self._refresh_accent_swatch()
-
-    def _pick_new_tab_background(self):
-        lang = self._current_lang()
-        filter_str = "Görseller (*.png *.jpg *.jpeg *.webp *.bmp)" if lang == "tr" else "Images (*.png *.jpg *.jpeg *.webp *.bmp)"
-        file_path, _ = QFileDialog.getOpenFileName(self, "Arkaplan Görseli Seç" if lang == "tr" else "Choose Background Image", os.path.expanduser("~"), filter_str)
-        if file_path:
-            try:
-                ext = os.path.splitext(file_path)[1].lower() or ".png"
-                dest_path = gem_paths.config_path(f"gem_new_tab_background{ext}")
-                shutil.copyfile(file_path, dest_path)
-                gem_paths.secure_chmod(dest_path, 0o600)
-                self._pending_bg_path = dest_path
-                self._refresh_bg_status_label()
-            except Exception as exc:
-                show_modern_info(self, f"Görsel kopyalanamadı: {exc}" if lang == "tr" else f"Could not copy image: {exc}", lang=lang, warning=True)
-
-    def _reset_new_tab_background(self):
-        self._pending_bg_path = ""
-        self._refresh_bg_status_label()
-
-    def _save_and_close(self):
-        self.settings_manager.current["language"] = "tr" if self.combo_lang.currentIndex() == 0 else "en"
-        self.settings_manager.current["ui_theme"] = "light" if self.combo_theme.currentIndex() == 1 else "dark"
-        self.settings_manager.current["accent_color"] = self._pending_accent
-        self.settings_manager.current["new_tab_background"] = self._pending_bg_path
-        self.settings_manager.current["force_dark_web"] = self.chk_force_dark.isChecked()
-        self.settings_manager.current["adblock_enabled"] = self.chk_adblock.isChecked()
-        self.settings_manager.current["js_enabled"] = self.chk_js.isChecked()
-        self.settings_manager.current["load_images"] = self.chk_img.isChecked()
-        self.settings_manager.current["search_suggestions"] = self.chk_suggestions.isChecked()
-        self.settings_manager.current["auto_restore_tabs"] = self.chk_auto_restore.isChecked()
-
-        old_hw = self.settings_manager.current.get("hardware_acceleration", True)
-        old_ram = self.settings_manager.current.get("low_ram_mode", False)
-        
-        self.settings_manager.current["hardware_acceleration"] = self.chk_hw_accel.isChecked()
-        self.settings_manager.current["low_ram_mode"] = self.chk_low_ram.isChecked()
-        self.settings_manager.current["vpn_enabled"] = self.chk_vpn.isChecked()
-        self.settings_manager.current["vpn_host"] = self.vpn_host_input.text().strip()
+    def run(self):
         try:
-            self.settings_manager.current["vpn_port"] = int(self.vpn_port_input.text().strip())
-        except ValueError:
-            self.settings_manager.current["vpn_port"] = 9050
-        self.settings_manager.save()
+            path = pdf_viewer.fetch_pdf_to_temp(self._url)
+            self.done_ok.emit(self._url, path)
+        except Exception as exc:
+            self.done_err.emit(self._url, str(exc))
 
-        if old_hw != self.chk_hw_accel.isChecked() or old_ram != self.chk_low_ram.isChecked():
-            lang = self._current_lang()
-            msg = "Ayarın etkili olması için GEM Browser'ı kapatıp yeniden açmanız gerekiyor." if lang == "tr" else "You need to close and reopen GEM Browser to take effect."
-            show_modern_info(self, msg, lang=lang)
-        self.accept()
+
+
+
+
+
+
+
+
+
+
+
+
 
 class MainWindow(QMainWindow):
-    def __init__(self, profile=None):
+    def __init__(self, profile=None, initial_url: QUrl = None):
         super().__init__()
         self.settings = BrowserSettings()
         self.lang = self.settings.current["language"]
         self._preview_popup = None
-        
+        # Açılıştaki masaüstü ikonu yazımı ertelenir (bkz.
+        # _update_desktop_icon); ilk _refresh_toolbar_icons senkron
+        # PNG yazımı + gtk-update-icon-cache subprocess'i yapmasın.
+        self._last_desktop_icon_accent = gem_theme.get_accent_color(self.settings.current)
+        self._desktop_icon_written = False
+        # "_create_page_for_new_window" ile açılan pencereler kurucudan
+        # about:blank sekmesiyle çıkar; aksi halde kurucunun otomatik
+        # "Yeni Sekme"si + hedef sayfa sekmesi olmak üzere iki sekme birikirdi.
+        self._startup_initial_url = initial_url
+
         if profile is None:
             self.shared_profile = _get_shared_normal_profile()
             self.is_incognito = False
-            self.setWindowTitle("GEM Browser")
+            self._base_title = "GEM Browser"
         else:
             self.shared_profile = profile
             self.is_incognito = True
-            self.setWindowTitle("GEM Browser 🕵️ (Gizli)" if self.lang == "tr" else "GEM Browser 🕵️ (Incognito)")
+            self._base_title = "GEM Browser 🕵️ (Gizli)" if self.lang == "tr" else "GEM Browser 🕵️ (Incognito)"
+        # ÖNEMLİ: setWindowTitle burada SABİT bir kere değil, aktif sekme
+        # değiştikçe / sayfa başlığı değiştikçe _update_window_title() ile
+        # tekrar tekrar çağrılır. Bu sayede Alt+Tab / görev çubuğu
+        # önizlemesinde "python3" ya da düz "GEM Browser" değil, diğer
+        # tarayıcılarda olduğu gibi "Sayfa Başlığı - GEM Browser" görünür.
+        self.setWindowTitle(self._base_title)
 
-        self.resize(1024, 768)
+        # Pencere durumunu geri yükle: kullanıcı en son nasıl bıraktıysa
+        # (boyut/konum/maksimize) aynı şekilde başlar. Kayıt yoksa veya
+        # geçersizse varsayılan 1024x768 normal pencere (tam ekran DEĞİL).
+        s = self.settings.current
+        try:
+            w = int(s.get("win_w", 1024)); h = int(s.get("win_h", 768))
+            if w >= 400 and h >= 300:
+                self.resize(w, h)
+            x = int(s.get("win_x", -1)); y = int(s.get("win_y", -1))
+            if x != -1 and y != -1:
+                self.move(x, y)
+        except (TypeError, ValueError):
+            pass
         self.setWindowIcon(self._app_icon())
 
         self.vault = None
@@ -987,13 +294,19 @@ class MainWindow(QMainWindow):
         self.vault_lock_timer.timeout.connect(self._lock_vault)
 
         self.download_manager = DownloadManager(self)
-        self.shared_profile.downloadRequested.connect(self.download_manager.handle_download)
-        
+        if not any(p is self.shared_profile for p in _download_connected_profiles):
+            _download_connected_profiles.append(self.shared_profile)
+            self._owns_download_signal = True
+            self.shared_profile.downloadRequested.connect(self.download_manager.handle_download)
+
         self.persistent_history = [] if self.is_incognito else gem_history.load_history()
         self.session_history = [entry.get("url", "") for entry in self.persistent_history]
         self.closed_tabs_stack = []
         self.tab_timers = {}
-        
+        # Dikey sidebar satırları (tab -> _SidebarTabRow): yükleme çizgisi ve
+        # ses ikonunu yeniden kurmadan güncellemek için.
+        self._sidebar_rows = {}
+
         self.adblock_interceptor = AdblockInterceptor(self)
         self._blocklist_thread = None
         self._load_and_maybe_update_blocklist()
@@ -1008,11 +321,21 @@ class MainWindow(QMainWindow):
 
         self.central_widget = QWidget(self)
         self.setCentralWidget(self.central_widget)
+        # Sürükle-bırak: PDF/dosya/url'yı pencereye bırakıp açma
+        self.setAcceptDrops(True)
         self.main_layout = QVBoxLayout(self.central_widget)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
 
         self._setup_toolbar()
         self._setup_tabs()
+        # Uygulama genelinde tuş filtresi (bkz. eventFilter): QtWebEngine
+        # F5/Ctrl+R/ESC gibi tarayıcı rezerve tuşlarını ShortcutOverride ile
+        # kendine aldığı için QAction kısayolları bu tuşlarda tetiklenmiyor.
+        # QApplication seviyesindeki filtre, tuş teslimatının en erken
+        # noktasında bunları yakalar.
+        _app = QApplication.instance()
+        if _app is not None:
+            _app.installEventFilter(self)
         self._apply_settings_to_browser()
         self._restore_session_or_new_tab()
 
@@ -1024,27 +347,21 @@ class MainWindow(QMainWindow):
     def hide_hover_preview(self):
         if self._preview_popup is not None:
             self._preview_popup.hide()
-            
+
     def _apply_vpn(self):
         """
-        Yerleşik VPN.
+        Yerleşik VPN — çalışma anında uygulanır, yeniden başlatma GEREKMEZ.
 
-        Brave/Opera'nın "tek tıkla VPN" özelliği, kendi işlettikleri ya da
-        anlaşmalı oldukları ÖZEL VE ÜCRETLİ sunucu altyapısına dayanır
-        (Opera -> SurfEasy sunucuları, Brave VPN -> Guardian/WireGuard
-        ortaklığı). Açık kaynaklı bir tarayıcının bunu ücretsiz sunması
-        mümkün değil. Eski implementasyon bunun yerine internetten rastgele
-        "ücretsiz public proxy" çekiyordu — bunların çoğu zaten çökmüş
-        olduğundan "site açılmıyor / aşırı yavaş" şikayetine yol açıyordu.
+        QtWebEngine, Qt'nin uygulama geneli proxy'sini (QNetworkProxy::
+        setApplicationProxy) sayfa trafiğine yansıtır; VPN açılıp kapandıkça
+        proxy burada güncellenir.
 
-        Bu yüzden iki gerçekçi ve dürüst seçenek sunuyoruz:
-          1) Kullanıcı Ayarlar'da kendi SOCKS5 proxy'sinin (kendi VPN
-             sağlayıcısı, kendi Tor kurulumu vb.) host/port'unu girerse
-             doğrudan onu kullanırız.
-          2) Host boş bırakılırsa, Brave/Opera'nın deneyimine en yakın
-             ÜCRETSİZ ve gerçek eşdeğer olan resmi Tor ağına otomatik
-             bağlanırız (bkz. gem_browser/tor_vpn.py). Bootstrap
-             tamamlanınca (`connected` sinyali) proxy otomatik uygulanır.
+        İki mod:
+          1) Kullanıcı Ayarlar'da kendi SOCKS5 proxy'sinin host/port'unu
+             girdiyse doğrudan onu kullanırız.
+          2) Host boşsa resmi Tor ağına bağlanırız (tor_vpn.py); bootstrap
+             tamamlanınca (`connected` sinyali) yerel SOCKS5 portu proxy
+             olarak ayarlanır.
         """
         enabled = self.settings.current.get("vpn_enabled", False)
 
@@ -1070,19 +387,19 @@ class MainWindow(QMainWindow):
             proxy.setHostName(host)
             proxy.setPort(port)
             QNetworkProxy.setApplicationProxy(proxy)
-            print(f"Yerleşik VPN (manuel SOCKS5): {host}:{port}")
         else:
-            # 2) Otomatik mod: Tor ağı.
+            # 2) Otomatik mod: Tor ağı (sabit SOCKS portıyla).
             self.tor_vpn.connect()
 
     def _on_vpn_status_changed(self, status: str, pct: int):
+        # Tor bootstrap tamamlandığında yerel SOCKS5 portunu uygulama geneli
+        # proxy olarak ayarla (QtWebEngine sayfa trafiğini de bundan geçirir).
         if status == "connected" and self.tor_vpn.socks_port:
             proxy = QNetworkProxy()
             proxy.setType(QNetworkProxy.ProxyType.Socks5Proxy)
             proxy.setHostName("127.0.0.1")
             proxy.setPort(self.tor_vpn.socks_port)
             QNetworkProxy.setApplicationProxy(proxy)
-            print(f"Yerleşik VPN (Tor) bağlandı: 127.0.0.1:{self.tor_vpn.socks_port}")
         elif status in ("disconnected", "error"):
             QNetworkProxy.setApplicationProxy(QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
 
@@ -1099,14 +416,15 @@ class MainWindow(QMainWindow):
             tab = self.tab_widget.widget(i)
             if not isinstance(tab, BrowserTab): continue
             url_str = tab.saved_url.toString() if tab.is_suspended else tab.view.url().toString()
-            if url_str and not (url_str.startswith("file://") and "gem_browser_new_tab" in url_str):
+            if url_str and not (_is_gem_internal_page(url_str)):
                 urls.append(url_str)
         return urls
 
     def _restore_session_or_new_tab(self):
         global _startup_session_checked
+        initial = getattr(self, "_startup_initial_url", None)
         if self.is_incognito or _startup_session_checked:
-            self.add_new_tab()
+            self.add_new_tab(initial) if initial is not None else self.add_new_tab()
             return
 
         _startup_session_checked = True
@@ -1114,7 +432,7 @@ class MainWindow(QMainWindow):
         gem_session.clear_session()
 
         if not tab_urls:
-            self.add_new_tab()
+            self.add_new_tab(initial) if initial is not None else self.add_new_tab()
             return
 
         # "auto_restore_tabs" açıksa, kullanıcıya hiç sormadan sekmeleri
@@ -1129,49 +447,87 @@ class MainWindow(QMainWindow):
 
         if should_restore:
             for index, url_str in enumerate(tab_urls):
-                self.add_new_tab(QUrl(url_str), switch_to=(index == 0))
+                self.add_new_tab(QUrl(url_str), switch_to=(index == 0 and initial is None))
+            if initial is not None:
+                self.add_new_tab(initial)
         else:
-            self.add_new_tab()
+            self.add_new_tab(initial) if initial is not None else self.add_new_tab()
 
     def _new_tab_url(self) -> str:
         return get_new_tab_url(
             self.settings.current["ui_theme"], self.lang,
             accent_color=gem_theme.get_accent_color(self.settings.current),
             background_image=self.settings.current.get("new_tab_background") or None,
+            search_engine=self.settings.current.get("search_engine", "brave"),
+            custom_search_url=self.settings.current.get("custom_search_url", ""),
         )
 
     def _refresh_new_tab_page(self, tab: BrowserTab) -> None:
         if tab.view is not None:
             tab.view.page().runJavaScript(f"window.location.replace({json.dumps(self._new_tab_url())});")
-        
-    def _update_desktop_icon(self, accent_color: str):
+
+    def _update_desktop_icon(self, accent_color: str, refresh_cache: bool = True):
         user_icon_dir = os.path.expanduser("~/.local/share/icons/hicolor/256x256/apps")
         os.makedirs(user_icon_dir, exist_ok=True)
         target_path = os.path.join(user_icon_dir, "gem-browser.png")
         pixmap = gem_icons.tinted_logo_pixmap(accent_color, 256)
         if not pixmap.isNull():
             pixmap.save(target_path, "PNG")
-            try:
-                subprocess.run(["gtk-update-icon-cache", "-f", os.path.expanduser("~/.local/share/icons/hicolor")], stderr=subprocess.DEVNULL)
-            except Exception: pass
+            if refresh_cache:
+                # gtk-update-icon-cache pahalıdır; yalnızca vurgu rengi
+                # GERÇEKTEN değiştiğinde çalıştırılır.
+                try:
+                    subprocess.run(["gtk-update-icon-cache", "-f", os.path.expanduser("~/.local/share/icons/hicolor")], stderr=subprocess.DEVNULL)
+                except Exception: pass
 
     def _apply_settings_to_browser(self):
         self.lang = self.settings.current["language"]
         accent = gem_theme.get_accent_color(self.settings.current)
         base_style = LIGHT_STYLE if self.settings.current["ui_theme"] == "light" else DARK_STYLE
         self.setStyleSheet(base_style.replace("ACCENT_PLACEHOLDER", accent).replace("ACCENT_TEXT_PLACEHOLDER", gem_theme.readable_text_color(accent)))
-        
-        self.shared_profile.setUrlRequestInterceptor(self.adblock_interceptor if self.settings.current["adblock_enabled"] else None)
+
+        # Interceptor HER ZAMAN takılı: PDF → görüntüleyici yönlendirmesi
+        # buradan geçer; reklam engelleme kapalıysa interceptor kendi
+        # içindeki enabled bayrağıyla yalnızca engellemeyi kapatır.
+        self.shared_profile.setUrlRequestInterceptor(self.adblock_interceptor)
+        self.adblock_interceptor.set_enabled(self.settings.current["adblock_enabled"])
 
         web_settings = self.shared_profile.settings()
         web_settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, self.settings.current["js_enabled"])
         web_settings.setAttribute(QWebEngineSettings.WebAttribute.AutoLoadImages, self.settings.current["load_images"])
         web_settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        # PDF.js görüntüleyici (file:// sayfası) yerel kaynaklara (indirilmiş
+        # ya da file:// yolu verilen PDF'lere) erişebilsin.
+        web_settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+        # HTML5 tam ekran (YouTube vb.) QtWebEngine'de VARSAYILAN OLARAK
+        # KAPALI gelir; bu öznitelik açık olmadan sayfaların
+        # requestFullscreen() çağrısı "Fullscreen is not supported" ile
+        # reddedilir ve fullScreenRequested sinyali hiç üretilmez.
+        # (browser_tab.py'deki _handle_fullscreen_request işleyicisi bu
+        # sinyali alıp view'i tam ekran yapar.)
+        web_settings.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
+        # VPN/Tor açıkken WebRTC sızıntısına karşı çalışma anı anahtarı:
+        # WebRTC yalnızca genel arayüzlerle sınırlanır (yerel IP adayları
+        # engellenir). Tam koruma (--force-webrtc-ip-handling-policy=
+        # disable_non_proxied_udp, proxy üzerinden zorlama) için yeniden
+        # başlatma gerekir — bkz. main.py.
+        vpn_on = bool(self.settings.current.get("vpn_enabled", False))
+        try:
+            web_settings.setAttribute(
+                QWebEngineSettings.WebAttribute.WebRTCPublicInterfacesOnly, vpn_on)
+        except AttributeError:
+            pass  # eski Qt: öznitelik yok
+        # PDF'ler indirme olarak değil, Chrome'daki gibi SEKME İÇİNDE
+        # Qt'nin yerleşik görüntüleyicisiyle açılsın.
+        try:
+            web_settings.setAttribute(QWebEngineSettings.WebAttribute.PdfViewerEnabled, True)
+        except AttributeError:
+            pass  # eski Qt sürümü (6.4 öncesi): öznitelik yok
 
         scripts = self.shared_profile.scripts()
         for s in scripts.toList():
             if s.name() == "ForceDarkMode": scripts.remove(s)
-                
+
         if self.settings.current["force_dark_web"]:
             dark_script = QWebEngineScript()
             dark_script.setSourceCode("(function() { if(window.location.href.indexOf('gem_browser_new_tab') !== -1) return; var css = 'html {-webkit-filter: invert(100%) hue-rotate(180deg) !important; filter: invert(100%) hue-rotate(180deg) !important; background: black;} img, video, iframe, canvas {-webkit-filter: invert(100%) hue-rotate(180deg) !important; filter: invert(100%) hue-rotate(180deg) !important;}'; var style = document.createElement('style'); style.type = 'text/css'; style.appendChild(document.createTextNode(css)); document.head.appendChild(style); })();")
@@ -1179,7 +535,7 @@ class MainWindow(QMainWindow):
             dark_script.setWorldId(QWebEngineScript.ScriptWorldId.ApplicationWorld)
             dark_script.setName("ForceDarkMode")
             scripts.insert(dark_script)
-            
+
         for i in range(self.tab_widget.count()):
             tab = self.tab_widget.widget(i)
             if isinstance(tab, BrowserTab) and not tab.is_suspended:
@@ -1190,6 +546,9 @@ class MainWindow(QMainWindow):
         self._refresh_close_buttons()
         self._refresh_toolbar_icons()
         self._rebuild_vertical_sidebar()
+        # Askıya alma süresi/canlı sekme sınırı ayarları anında uygulansın.
+        self._update_suspend_timers()
+        self._enforce_max_live_tabs()
 
         self.url_bar.setPlaceholderText("Web'de arayın veya bir URL girin..." if self.lang == "tr" else "Search the web or enter URL...")
         self.action_new_tab.setText("Yeni Sekme" if self.lang == "tr" else "New Tab")
@@ -1207,6 +566,23 @@ class MainWindow(QMainWindow):
             self.vertical_tabs_btn.setToolTip("Dikey Sekme Çubuğu" if self.lang == "tr" else "Vertical Tab Bar")
         self.action_set_default_browser.setText("Varsayılan Tarayıcı Yap" if self.lang == "tr" else "Set as Default Browser")
         self.action_settings.setText("Ayarlar" if self.lang == "tr" else "Settings")
+        self.action_find.setText("Sayfada Ara" if self.lang == "tr" else "Find in Page")
+        self.action_open_file.setText("Dosya Aç" if self.lang == "tr" else "Open File")
+        self.action_fullscreen.setText("Tam Ekran (F11)" if self.lang == "tr" else "Full Screen (F11)")
+        self.action_clear_data.setText("Tarama Verilerini Temizle" if self.lang == "tr" else "Clear Browsing Data")
+        self.action_print.setText("Yazdır" if self.lang == "tr" else "Print")
+        self.action_save_pdf.setText("PDF Olarak Kaydet" if self.lang == "tr" else "Save as PDF")
+        self.action_save_page.setText("Sayfayı Kaydet" if self.lang == "tr" else "Save Page")
+        self.action_view_source.setText("Sayfa Kaynağını Görüntüle" if self.lang == "tr" else "View Page Source")
+        self.action_devtools.setText("Geliştirici Araçları (F12)" if self.lang == "tr" else "Developer Tools (F12)")
+        self.action_dup_tab.setText("Sekmeyi Çoğalt" if self.lang == "tr" else "Duplicate Tab")
+        self.action_mute_tab.setText("Sesi Kapat / Aç" if self.lang == "tr" else "Mute / Unmute Tab")
+        self.action_tab_search.setText("Sekme Ara" if self.lang == "tr" else "Search Tabs")
+        # Arama motoru değişmiş olabilir: öneri uç noktasını güncelle.
+        self._remote_suggester.set_engine(self.settings.current.get("search_engine", "brave"))
+        self._update_url_extras()
+        if self.settings.current.get("vault_session_unlock", False):
+            self.vault_lock_timer.stop()
         self._apply_vpn()
 
     def _load_and_maybe_update_blocklist(self):
@@ -1238,6 +614,12 @@ class MainWindow(QMainWindow):
         if not silent: show_modern_info(self, ("Liste güncellenemedi: " if self.lang == "tr" else "Update failed: ") + err, lang=self.lang, warning=True)
 
     def _inject_cookie_banner_hider(self):
+        # Bu metod her MainWindow kuruluşunda çağrılır; paylaşılan profile
+        # aynı isimli script defalarca eklenip her sayfada N kez
+        # enjekte edilmesin diye isim kontrolü yapıyoruz.
+        scripts = self.shared_profile.scripts()
+        if any(s.name() == "CookieBannerHider" for s in scripts.toList()):
+            return
         script = QWebEngineScript()
         script.setSourceCode("(function() { var style = document.createElement('style'); style.textContent = '#cookie-notice, .cc-window, .cookie-banner, #onetrust-consent-sdk, #cmpbox, .CybotCookiebotDialog, #ez-cookie-dialog, .qc-cmp2-container { display: none !important; }'; document.head.appendChild(style); })();")
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
@@ -1278,11 +660,37 @@ class MainWindow(QMainWindow):
 
         self.url_bar = QLineEdit(self)
         self.url_bar.returnPressed.connect(self._load_url_from_bar)
+
+        # Adres çubuğu aksiyonları: BAŞTA güvenlik göstergesi (kilit),
+        # SONDA favori yıldızı. QLineEdit aksiyon ikonlarını alanın en
+        # ucuna YAPIŞIK çizer (pixmap'e padding gömmek, ikon ölçeklendiği
+        # için görünmez) — bu yüzden kenarlardan içeride tutan ŞEFFAF
+        # dolgu aksiyonları kullanılıyor.
+        self._pad_action_left = QAction(self)
+        self._pad_action_left.setIcon(_transparent_icon(8, 14))
+        self.url_bar.addAction(self._pad_action_left, QLineEdit.ActionPosition.LeadingPosition)
+
+        self.security_action = QAction(self)
+        self.security_action.setVisible(False)
+        self.security_action.triggered.connect(self._show_security_info)
+        self.url_bar.addAction(self.security_action, QLineEdit.ActionPosition.LeadingPosition)
+
+        # NOT: TrailingPosition aksiyonları EKLEME SIRASININ TERSİ dizilir;
+        # yıldızın sağına dolgu düşmesi için dolgu aksiyonu ÖNCE eklenir.
+        self._pad_action_right = QAction(self)
+        self._pad_action_right.setIcon(_transparent_icon(8, 14))
+        self.url_bar.addAction(self._pad_action_right, QLineEdit.ActionPosition.TrailingPosition)
+
+        self.star_action = QAction(self)
+        self.star_action.setVisible(False)
+        self.star_action.triggered.connect(self._toggle_bookmark)
+        self.url_bar.addAction(self.star_action, QLineEdit.ActionPosition.TrailingPosition)
+
         self._suggestion_popup = None
         self._suggestion_popup_theme = None
         self._current_url_text = ""
         self._current_local_entries = []
-        self._remote_suggester = RemoteSuggester(self)
+        self._remote_suggester = RemoteSuggester(self, engine=self.settings.current.get("search_engine", "brave"))
         self._remote_suggester.suggestions_ready.connect(self._on_remote_suggestions)
         self.url_bar.textEdited.connect(self._on_url_text_edited)
         self.url_bar.installEventFilter(self)
@@ -1303,7 +711,7 @@ class MainWindow(QMainWindow):
         self.menu_btn = QToolButton(self)
         self.menu_btn.setIconSize(QSize(18, 18))
         self.menu_btn.setStyleSheet("QToolButton { padding: 6px 10px; border: none; border-radius: 8px; background: transparent; } QToolButton::menu-indicator { image: none; } QToolButton:hover { background: rgba(128, 128, 128, 0.2); }")
-        
+
         self.main_menu = QMenu(self)
         self.action_new_tab = QAction("", self)
         self.action_new_tab.setShortcut("Ctrl+T")
@@ -1312,15 +720,15 @@ class MainWindow(QMainWindow):
         self.action_reopen_tab = QAction("", self)
         self.action_reopen_tab.setShortcut("Ctrl+Shift+T")
         self.action_reopen_tab.triggered.connect(self._reopen_closed_tab)
-        
+
         self.action_new_win = QAction("", self)
         self.action_new_win.setShortcut("Ctrl+N")
         self.action_new_win.triggered.connect(self._open_new_window)
-        
+
         self.action_incognito = QAction("", self)
         self.action_incognito.setShortcut("Ctrl+Shift+N")
         self.action_incognito.triggered.connect(self._open_incognito_window)
-        
+
         self.action_downloads = QAction("", self)
         self.action_downloads.setShortcut("Ctrl+J")
         self.action_downloads.triggered.connect(self._open_downloads_dialog)
@@ -1328,7 +736,7 @@ class MainWindow(QMainWindow):
         self.action_history = QAction("", self)
         self.action_history.setShortcut("Ctrl+H")
         self.action_history.triggered.connect(self._open_history)
-        
+
         self.action_pwd = QAction("", self)
         self.action_pwd.triggered.connect(self._open_password_manager)
 
@@ -1353,22 +761,132 @@ class MainWindow(QMainWindow):
         self.action_settings = QAction("", self)
         self.action_settings.triggered.connect(self._open_settings)
 
+        # Ctrl+F (sayfada ara) ve F5/Ctrl+R (yenile) QAction kısayolu olarak
+        # tanımlanır: keyPressEvent'e koyulan kısayollar, odak web
+        # görünümündeyken Chromium tarafından tüketildiği için HİÇ
+        # tetiklenmezdi; QAction shortcut'ları Qt'nin ShortcutOverride
+        # mekanizmasıyla bu durumda da çalışır.
+        self.action_find = QAction("", self)
+        self.action_find.setShortcut(QKeySequence.StandardKey.Find)
+        self.action_find.triggered.connect(self._find_in_page)
+
+        self.action_full_reload = QAction(self)
+        # StandardKey.Refresh platforma/masaüstüne göre farklı tanımlanabilir;
+        # F5'in HER ORTAMDA çalışması için kısayolları açıkça listeliyoruz.
+        self.action_full_reload.setShortcuts([QKeySequence("F5"), QKeySequence("Ctrl+R")])
+        self.action_full_reload.triggered.connect(self._reload_page)
+
+        # F11: pencere genelinde tam ekran. Eskiden hiçbir kısayol/aksiyon
+        # tanımlı olmadığı için F11 hiçbir şey yapmıyordu.
+        self.action_fullscreen = QAction("", self)
+        self.action_fullscreen.setShortcut(QKeySequence("F11"))
+        self.action_fullscreen.triggered.connect(self._toggle_window_fullscreen)
+
+        # --- Klavye kısayol paketi (Chrome/Firefox standartları) ---
+        # NOT: Bu tuşlardan Chromium'un ShortcutOverride ile rezerve
+        # ettikleri (Ctrl+W, Ctrl+Tab, Ctrl+1..9, Alt+Yön) QAction üzerinden
+        # tetiklenmeyebilir; hepsinin karşılığı app-level eventFilter'da da
+        # vardır (bkz. eventFilter) — ikisi birbirini tamamlar, çifte
+        # tetiklenme olmaz (kısayol tüketilirse KeyPress teslim edilmez).
+        self.action_focus_url = QAction(self)
+        self.action_focus_url.setShortcut(QKeySequence("Ctrl+L"))
+        self.action_focus_url.triggered.connect(self._focus_url_bar)
+
+        self.action_open_file = QAction("", self)
+        self.action_open_file.setShortcut(QKeySequence("Ctrl+O"))
+        self.action_open_file.triggered.connect(self._open_file_dialog)
+
+        # --- Sayfa ve sekme eylemleri ---
+        self.action_print = QAction("", self)
+        self.action_print.setShortcut(QKeySequence("Ctrl+P"))
+        self.action_print.triggered.connect(self._print_page)
+
+        self.action_save_pdf = QAction("", self)
+        self.action_save_pdf.triggered.connect(self._save_page_as_pdf)
+
+        self.action_save_page = QAction("", self)
+        self.action_save_page.setShortcut(QKeySequence("Ctrl+S"))
+        self.action_save_page.triggered.connect(self._save_page)
+
+        self.action_view_source = QAction("", self)
+        self.action_view_source.setShortcut(QKeySequence("Ctrl+U"))
+        self.action_view_source.triggered.connect(self._view_source)
+
+        self.action_devtools = QAction("", self)
+        self.action_devtools.setShortcut(QKeySequence("F12"))
+        self.action_devtools.triggered.connect(self._toggle_devtools)
+
+        self.action_dup_tab = QAction("", self)
+        self.action_dup_tab.triggered.connect(lambda: self._duplicate_tab())
+
+        self.action_mute_tab = QAction("", self)
+        self.action_mute_tab.setShortcut(QKeySequence("Ctrl+M"))
+        self.action_mute_tab.triggered.connect(lambda: self._toggle_tab_mute())
+
+        self.action_tab_search = QAction("", self)
+        self.action_tab_search.setShortcut(QKeySequence("Ctrl+Shift+A"))
+        self.action_tab_search.triggered.connect(self._tab_search)
+
+        self.action_clear_data = QAction("", self)
+        self.action_clear_data.setShortcut(QKeySequence("Ctrl+Shift+Delete"))
+        self.action_clear_data.triggered.connect(self._open_clear_data)
+
+        self.action_close_tab_ks = QAction(self)
+        self.action_close_tab_ks.setShortcut(QKeySequence("Ctrl+W"))
+        self.action_close_tab_ks.triggered.connect(
+            lambda: self.close_tab(self.tab_widget.currentIndex()))
+
+        self.action_next_tab = QAction(self)
+        self.action_next_tab.setShortcut(QKeySequence("Ctrl+Tab"))
+        self.action_next_tab.triggered.connect(lambda: self._cycle_tab(1))
+
+        self.action_prev_tab = QAction(self)
+        self.action_prev_tab.setShortcut(QKeySequence("Ctrl+Shift+Tab"))
+        self.action_prev_tab.triggered.connect(lambda: self._cycle_tab(-1))
+
+        self.action_alt_back = QAction(self)
+        self.action_alt_back.setShortcut(QKeySequence("Alt+Left"))
+        self.action_alt_back.triggered.connect(self._navigate_back)
+
+        self.action_alt_forward = QAction(self)
+        self.action_alt_forward.setShortcut(QKeySequence("Alt+Right"))
+        self.action_alt_forward.triggered.connect(self._navigate_forward)
+
+        self._tab_number_actions = []
+        for n in range(1, 10):
+            act = QAction(self)
+            act.setShortcut(QKeySequence(f"Ctrl+{n}"))
+            act.triggered.connect(lambda checked=False, num=n: self._goto_tab_number(num))
+            self._tab_number_actions.append(act)
+
         self._menu_action_icons = {
             self.action_new_tab: "plus", self.action_reopen_tab: "undo", self.action_new_win: "window",
             self.action_incognito: "incognito", self.action_downloads: "download", self.action_history: "history",
             self.action_pwd: "lock", self.action_update_blocklist: "shield", self.action_set_default_browser: "star",
             self.action_settings: "settings", self.action_zoom_in: "zoom-in", self.action_zoom_out: "zoom-out",
-            self.action_zoom_reset: "zoom-reset",
+            self.action_zoom_reset: "zoom-reset", self.action_fullscreen: "window",
+            self.action_clear_data: "shield", self.action_print: "printer",
+            self.action_save_pdf: "download", self.action_save_page: "download",
+            self.action_view_source: "globe", self.action_devtools: "pip",
+            self.action_dup_tab: "window", self.action_mute_tab: "volume-off",
+            self.action_tab_search: "search",
         }
 
         self.main_menu.addActions([self.action_new_tab, self.action_reopen_tab, self.action_new_win, self.action_incognito])
         self.main_menu.addSeparator()
         self.main_menu.addActions([self.action_downloads, self.action_history, self.action_pwd, self.action_update_blocklist])
+        self.main_menu.addAction(self.action_clear_data)
+        self.main_menu.addSeparator()
+        self.main_menu.addActions([self.action_print, self.action_save_pdf, self.action_save_page,
+                                   self.action_view_source, self.action_devtools])
+        self.main_menu.addSeparator()
+        self.main_menu.addActions([self.action_dup_tab, self.action_mute_tab, self.action_tab_search])
         self.main_menu.addSeparator()
         self.main_menu.addActions([self.action_zoom_in, self.action_zoom_out, self.action_zoom_reset])
+        self.main_menu.addAction(self.action_fullscreen)
         self.main_menu.addSeparator()
         self.main_menu.addActions([self.action_set_default_browser, self.action_settings])
-        
+
         self.menu_btn.setMenu(self.main_menu)
         self.menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.toolbar.addWidget(self.menu_btn)
@@ -1384,7 +902,17 @@ class MainWindow(QMainWindow):
     def _refresh_toolbar_icons(self):
         colors = self._theme_colors()
         accent, disabled = colors["accent"], colors["disabled"]
-        self._update_desktop_icon(accent)
+        # _update_desktop_icon diske PNG yazar + gtk-update-icon-cache
+        # çalıştırır; her tazelemede (ve her yeni sekmede) tekrarlanmasın
+        # diye yalnızca vurgu rengi gerçekten değiştiğinde çağrılıyor.
+        # AÇILIŞTA: yazım ertelenir (pencere gösterildikten ~2 sn sonra,
+        # arka planda) — gtk-update-icon-cache açılışı geciktirmesin.
+        if accent != getattr(self, "_last_desktop_icon_accent", None):
+            self._last_desktop_icon_accent = accent
+            self._update_desktop_icon(accent, refresh_cache=True)
+        elif not getattr(self, "_desktop_icon_written", False):
+            self._desktop_icon_written = True
+            QTimer.singleShot(2000, lambda: self._update_desktop_icon(accent, refresh_cache=False))
         self.back_btn.setIcon(gem_icons.get_icon("back", accent, disabled, size=18))
         self.forward_btn.setIcon(gem_icons.get_icon("forward", accent, disabled, size=18))
         self.reload_btn.setIcon(gem_icons.get_icon("reload", accent, disabled, size=17))
@@ -1406,7 +934,7 @@ class MainWindow(QMainWindow):
                 f"QToolButton:hover {{ background-color: {hover_bg}; }}"
             )
             self.new_tab_btn.setPlusColor(accent)
-            
+
         if hasattr(self, "_sidebar_new_tab_btn"):
             self._sidebar_new_tab_btn.setStyleSheet(
                 f"QToolButton {{ background-color: {bg_color}; "
@@ -1414,17 +942,19 @@ class MainWindow(QMainWindow):
                 f"QToolButton:hover {{ background-color: {hover_bg}; }}"
             )
             self._sidebar_new_tab_btn.setPlusColor(accent)
-            
+
         # Alt dock ikonlarını vurgu rengiyle (accent) güncelle
         if hasattr(self, "sidebar_dl_btn"):
             dock_btn_style = "QToolButton { border: none; background: transparent; border-radius: 6px; } QToolButton:hover { background: rgba(128,128,128,0.2); }"
-            
+        if hasattr(self, "sidebar_pin_btn"):
+            self._update_sidebar_pin_button()
+
             self.sidebar_dl_btn.setIcon(gem_icons.get_icon("download", accent, size=18))
             self.sidebar_dl_btn.setStyleSheet(dock_btn_style)
-            
+
             self.sidebar_hist_btn.setIcon(gem_icons.get_icon("history", accent, size=18))
             self.sidebar_hist_btn.setStyleSheet(dock_btn_style)
-            
+
             self.sidebar_set_btn.setIcon(gem_icons.get_icon("settings", accent, size=18))
             self.sidebar_set_btn.setStyleSheet(dock_btn_style)
 
@@ -1439,7 +969,7 @@ class MainWindow(QMainWindow):
                 tab = self.tab_widget.widget(i)
                 if isinstance(tab, BrowserTab):
                     url_str = tab.saved_url.toString() if tab.is_suspended else (tab.view.url().toString() if tab.view is not None else "")
-                    if url_str.startswith("file://") and "gem_browser_new_tab" in url_str:
+                    if _is_gem_internal_page(url_str):
                         self.tab_widget.setTabIcon(i, app_icon)
 
         group_bg = "rgba(0, 0, 0, 0.035)" if is_light else "rgba(255, 255, 255, 0.04)"
@@ -1484,7 +1014,9 @@ class MainWindow(QMainWindow):
     def _render_suggestions(self, text: str, remote_items: list):
         entries = []
         seen_values = set()
-        entries.append({"kind": "search", "title": f'“{text}” için ara' if self.lang == "tr" else f'Search for “{text}”', "subtitle": "Brave Search", "value": text, "primary": True})
+        engine_label = search_engine_label(
+            self.settings.current.get("search_engine", "brave"), self.lang)
+        entries.append({"kind": "search", "title": f'“{text}” için ara' if self.lang == "tr" else f'Search for “{text}”', "subtitle": engine_label, "value": text, "primary": True})
         seen_values.add(text.lower())
         for e in self._current_local_entries:
             if e["value"].lower() not in seen_values:
@@ -1498,20 +1030,25 @@ class MainWindow(QMainWindow):
 
     def _show_suggestions(self, entries: list, query: str = ""):
         theme = "light" if self.settings.current["ui_theme"] == "light" else "dark"
-        if self._suggestion_popup is None or self._suggestion_popup_theme != theme:
+        accent = gem_theme.get_accent_color(self.settings.current)
+        popup_key = (theme, accent)
+        # Tema VEYA vurgu rengi değiştiyse popup'ı yeniden kur — satır
+        # vurguları vurgu renginden türetildiği için sadece tema takibi
+        # yetmezdi (renk değişince eski renkli popup ekranda kalırdı).
+        if self._suggestion_popup is None or getattr(self, "_suggestion_popup_key", None) != popup_key:
             if self._suggestion_popup is not None:
                 self._suggestion_popup.hide()
                 self._suggestion_popup.deleteLater()
-            self._suggestion_popup = SuggestionPopup(self, theme=theme)
+            self._suggestion_popup = SuggestionPopup(self, theme=theme, accent=accent)
             self._suggestion_popup.item_chosen.connect(self._on_suggestion_chosen)
-            self._suggestion_popup_theme = theme
-            
+            self._suggestion_popup_key = popup_key
+
             hl_bg = "rgba(255, 255, 255, 0.15)" if theme == "dark" else "rgba(0, 0, 0, 0.1)"
             self._suggestion_popup.setStyleSheet(f"""
                 QListWidget::item:selected {{ background-color: {hl_bg}; border-radius: 6px; font-weight: bold; }}
                 *[selected="true"] {{ background-color: {hl_bg}; border-radius: 6px; font-weight: bold; }}
             """)
-            
+
         self._suggestion_popup.set_entries(entries, query=query)
         self._suggestion_popup.position_below(self.url_bar)
         self._suggestion_popup.show()
@@ -1525,14 +1062,28 @@ class MainWindow(QMainWindow):
         tab = self.current_tab()
         if not tab: return
         if tab.is_suspended: tab.restore()
+        self._enforce_max_live_tabs()
 
         if kind in ("bookmark", "history"):
             self._set_url_bar_text(value)
             tab.view.setUrl(QUrl(value))
         else:
             self._set_url_bar_text(value)
-            tab.view.setUrl(QUrl(f"https://search.brave.com/search?q={quote_plus(value)}"))
+            tab.view.setUrl(QUrl(build_search_url(
+                value,
+                self.settings.current.get("search_engine", "brave"),
+                self.settings.current.get("custom_search_url", ""),
+            )))
         self.url_bar.clearFocus()
+
+    def _fullscreen_view_tab(self):
+        """Video tam ekranında olan (view'i bağımsız pencere yapılmış) sekmeyi
+        döndürür; yoksa None."""
+        for i in range(self.tab_widget.count()):
+            tab = self.tab_widget.widget(i)
+            if isinstance(tab, BrowserTab) and getattr(tab, "_is_fullscreen_view", False):
+                return tab
+        return None
 
     def eventFilter(self, obj, event):
         if obj is self.url_bar and self._suggestion_popup is not None and self._suggestion_popup.isVisible():
@@ -1554,6 +1105,113 @@ class MainWindow(QMainWindow):
                         return True
             elif event.type() == event.Type.FocusOut:
                 QTimer.singleShot(150, self._hide_suggestions)
+
+        # --- Uygulama genelinde tuş yakalama (bkz. __init__ notu) ---
+        # QAction kısayolları, Chromium'un ShortcutOverride ile rezerve
+        # ettiği tuşlarda (F5/Ctrl+R/ESC) çalışmaz; bu tuşlar burada,
+        # teslimatın en erken noktasında yakalanır. F5 QAction'ı bilerek
+        # duruyor: odak web görünümünde DEĞİLken (ör. araç çubuğu) yine
+        # QAction üzerinden çalışır; ikisi asla çifte tetiklenmez (kısayol
+        # tüketilirse KeyPress teslim edilmez; teslim edilirse QAction
+        # zaten ateşlenmemiştir).
+        #
+        # Çoklu pencere notu: her MainWindow bu filtreyi kurar; yalnızca
+        # OLAYIN ait olduğu pencere işlemeli. F5/Ctrl+F için "aktif pencere
+        # benim"; ESC için ek olarak "aktif pencere, benim sekmemin
+        # bağımsız tam ekran görüntüleyicisi" durumu da geçerlidir (video
+        # tam ekranındayken aktif pencere MainWindow değil, view'in
+        # kendisidir).
+        if event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            mods = event.modifiers()
+            ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+            shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+            tab_fs = self._fullscreen_view_tab()
+            fs_window_active = (
+                tab_fs is not None
+                and QApplication.activeWindow() is tab_fs.view
+            )
+            window_active = self.isActiveWindow()
+
+            if key == Qt.Key.Key_F5 or (ctrl and key == Qt.Key.Key_R):
+                if window_active or fs_window_active:
+                    self._reload_page()
+                    return True
+            elif key == Qt.Key.Key_Escape:
+                if tab_fs is not None and (window_active or fs_window_active):
+                    # Sayfa tarafının fullscreen durumunu da düzgün kapat.
+                    if tab_fs.web_page is not None:
+                        try:
+                            tab_fs.web_page.runJavaScript(
+                                "if(document.fullscreenElement){document.exitFullscreen();}")
+                        except RuntimeError:
+                            pass
+                    tab_fs._exit_view_fullscreen()
+                    return True
+            elif ctrl and key == Qt.Key.Key_F:
+                if window_active or fs_window_active:
+                    self._find_in_page()
+                    return True
+            elif key == Qt.Key.Key_F12:
+                if window_active or fs_window_active:
+                    self._toggle_devtools()
+                    return True
+            elif ctrl and key == Qt.Key.Key_P:
+                if window_active:
+                    self._print_page()
+                    return True
+            elif ctrl and key == Qt.Key.Key_D:
+                if window_active:
+                    self._toggle_bookmark()
+                    return True
+            elif ctrl and key == Qt.Key.Key_S:
+                if window_active:
+                    self._save_page()
+                    return True
+            elif ctrl and key == Qt.Key.Key_U:
+                if window_active:
+                    self._view_source()
+                    return True
+            elif ctrl and key == Qt.Key.Key_M:
+                if window_active:
+                    self._toggle_tab_mute()
+                    return True
+            elif ctrl and key == Qt.Key.Key_A and event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                if window_active:
+                    self._tab_search()
+                    return True
+            elif ctrl and key == Qt.Key.Key_Delete and event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                if window_active:
+                    self._open_clear_data()
+                    return True
+            elif ctrl and key == Qt.Key.Key_W:
+                if window_active:
+                    self.close_tab(self.tab_widget.currentIndex())
+                    return True
+            elif ctrl and key == Qt.Key.Key_L:
+                if window_active:
+                    self._focus_url_bar()
+                    return True
+            elif ctrl and key == Qt.Key.Key_Tab:
+                if window_active:
+                    self._cycle_tab(1)
+                    return True
+            elif ctrl and key == Qt.Key.Key_Backtab:
+                if window_active:
+                    self._cycle_tab(-1)
+                    return True
+            elif key == Qt.Key.Key_Left and event.modifiers() & Qt.KeyboardModifier.AltModifier:
+                if window_active or fs_window_active:
+                    self._navigate_back()
+                    return True
+            elif key == Qt.Key.Key_Right and event.modifiers() & Qt.KeyboardModifier.AltModifier:
+                if window_active or fs_window_active:
+                    self._navigate_forward()
+                    return True
+            elif ctrl and Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+                if window_active:
+                    self._goto_tab_number(key - Qt.Key.Key_0)
+                    return True
         return super().eventFilter(obj, event)
 
     def _open_new_window(self):
@@ -1568,17 +1226,38 @@ class MainWindow(QMainWindow):
 
     def _create_page_for_new_window(self, window_type):
         if window_type in (QWebEnginePage.WebWindowType.WebBrowserWindow, QWebEnginePage.WebWindowType.WebDialog):
-            new_win = MainWindow(profile=self.shared_profile) if self.is_incognito else MainWindow()
+            # MainWindow, kurucudaki _startup_initial_url sayesinde zaten TEK
+            # bir about:blank sekmesiyle açılır; eskiden hem kurucu hem de
+            # aşağıdaki add_new_tab birer sekme açtığı için her popup/target=
+            # _blank penceresi fazladan bir "Yeni Sekme" ile gelirdi.
+            blank = QUrl("about:blank")
+            new_win = (MainWindow(profile=self.shared_profile, initial_url=blank)
+                       if self.is_incognito else MainWindow(initial_url=blank))
             _active_windows.append(new_win)
             new_win.show()
-            return new_win.add_new_tab(QUrl("about:blank")).web_page
+            tab = new_win.current_tab()
+            return tab.web_page if tab is not None else new_win.add_new_tab(blank).web_page
         else:
             return self.add_new_tab(QUrl("about:blank"), switch_to=(window_type != QWebEnginePage.WebWindowType.WebBrowserBackgroundTab)).web_page
 
-    def _open_downloads_dialog(self): DownloadsDialog(self).exec()
-    def _open_history(self): HistoryDialog(self.persistent_history, self.lang, self).exec()
+    def _open_downloads_dialog(self):
+        dlg = DownloadsDialog(self)
+        # exec() kapandıktan sonra C++ nesnesi parent'a child olarak takılı
+        # kalıyordu (history_changed bağlantısıyla birlikte sızıyordu);
+        # WA_DeleteOnClose ile kapanır kapanmaz silinir.
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.exec()
+
+    def _open_history(self):
+        dlg = HistoryDialog(self.persistent_history, self.lang, self)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.exec()
+
     def _open_settings(self):
-        if SettingsDialog(self.settings, self).exec(): self._apply_settings_to_browser()
+        dlg = SettingsDialog(self.settings, self)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        if dlg.exec():
+            self._apply_settings_to_browser()
 
     def _zoom_in(self): tab = self.current_tab(); (tab.zoom_in() if isinstance(tab, BrowserTab) and not tab.is_suspended else None)
     def _zoom_out(self): tab = self.current_tab(); (tab.zoom_out() if isinstance(tab, BrowserTab) and not tab.is_suspended else None)
@@ -1607,7 +1286,7 @@ class MainWindow(QMainWindow):
         self.tab_widget.tabBar().new_tab_btn = self.new_tab_btn
         self.new_tab_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.new_tab_btn.setFixedSize(28, 28)
-        
+
         self.new_tab_btn.clicked.connect(lambda: self.add_new_tab())
         self.tab_widget.tabBar()._update_btn_pos()
 
@@ -1622,7 +1301,7 @@ class MainWindow(QMainWindow):
         self.vertical_sidebar = _CollapsibleSidebar(self.tabs_container)
 
         self._sidebar_content = QWidget()
-        self._sidebar_content.setMinimumWidth(220) 
+        self._sidebar_content.setMinimumWidth(220)
         self._sidebar_layout = QVBoxLayout(self._sidebar_content)
         self._sidebar_layout.setContentsMargins(6, 8, 6, 8)
         self._sidebar_layout.setSpacing(2)
@@ -1631,12 +1310,21 @@ class MainWindow(QMainWindow):
         self._sidebar_new_tab_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._sidebar_new_tab_btn.setFixedSize(28, 28)
         self._sidebar_new_tab_btn.clicked.connect(lambda: self.add_new_tab())
-        
+
+        # Sidebarı sabitleme butonu (+ ikonunun bulunduğu üst sıranın sağında)
+        self.sidebar_pin_btn = QToolButton(self._sidebar_content)
+        self.sidebar_pin_btn.setFixedSize(28, 28)
+        self.sidebar_pin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sidebar_pin_btn.setToolTip("Sidebarı Sabitle" if self.lang == "tr" else "Pin Sidebar")
+        self.sidebar_pin_btn.clicked.connect(self._toggle_sidebar_pin)
+        self._sidebar_pinned = False
+
         btn_layout = QHBoxLayout()
-        btn_layout.setContentsMargins(12, 0, 0, 0)
+        btn_layout.setContentsMargins(12, 0, 8, 0)
         btn_layout.addWidget(self._sidebar_new_tab_btn)
         btn_layout.addStretch()
-        
+        btn_layout.addWidget(self.sidebar_pin_btn)
+
         self._sidebar_layout.addLayout(btn_layout)
         self._sidebar_layout.addStretch(1)
 
@@ -1693,6 +1381,25 @@ class MainWindow(QMainWindow):
                 "QToolButton:hover { background: rgba(128, 128, 128, 0.2); }"
             )
 
+    def _toggle_sidebar_pin(self):
+        self._sidebar_pinned = not self._sidebar_pinned
+        self.vertical_sidebar.set_pinned(self._sidebar_pinned)
+        self._update_sidebar_pin_button()
+
+    def _update_sidebar_pin_button(self):
+        if not hasattr(self, "sidebar_pin_btn"):
+            return
+        accent = gem_theme.get_accent_color(self.settings.current)
+        if self._sidebar_pinned:
+            self.sidebar_pin_btn.setIcon(gem_icons.get_icon("pin", accent, size=16))
+            self.sidebar_pin_btn.setToolTip(
+                "Sidebarı Sabitini Kaldır" if self.lang == "tr" else "Unpin Sidebar")
+        else:
+            muted = "#777777" if self.settings.current["ui_theme"] == "light" else "#888888"
+            self.sidebar_pin_btn.setIcon(gem_icons.get_icon("pin", muted, size=16))
+            self.sidebar_pin_btn.setToolTip(
+                "Sidebarı Sabitle" if self.lang == "tr" else "Pin Sidebar")
+
     def _toggle_vertical_tabs(self):
         self._vertical_mode = not self._vertical_mode
         self.settings.current["vertical_tabs"] = self._vertical_mode
@@ -1701,9 +1408,10 @@ class MainWindow(QMainWindow):
 
     def _rebuild_vertical_sidebar(self):
         if not getattr(self, "_vertical_mode", False):
+            self._sidebar_rows = {}
             return
-            
-        # Sabit obje sayımız 3'e çıktığı için (Yeni Sekme, Boşluk, Alt İkonlar) 
+
+        # Sabit obje sayımız 3'e çıktığı için (Yeni Sekme, Boşluk, Alt İkonlar)
         # burayı > 3 yapıyoruz ki aradaki boşluğu (Stretch) silmesin.
         while self._sidebar_layout.count() > 3:
             item = self._sidebar_layout.takeAt(1)
@@ -1711,10 +1419,14 @@ class MainWindow(QMainWindow):
             if w is not None:
                 w.deleteLater()
 
+        self._sidebar_rows = {}
         current = self.current_tab()
         pinned_rows, normal_rows = [], []
         is_light = self.settings.current["ui_theme"] == "light"
-        
+        accent = gem_theme.get_accent_color(self.settings.current)
+        bar = self.tab_widget.tabBar()
+        progress_map = bar.progress_map if isinstance(bar, ProgressTabBar) else {}
+
         for i in range(self.tab_widget.count()):
             tab = self.tab_widget.widget(i)
             if not isinstance(tab, BrowserTab):
@@ -1724,13 +1436,17 @@ class MainWindow(QMainWindow):
             row = _SidebarTabRow(
                 tab=tab, title=title, icon=self.tab_widget.tabIcon(i),
                 pinned=pinned, selected=(tab is current), is_light=is_light, lang=self.lang,
+                accent=accent,
             )
+            # Yeniden kurulum yükleme ortasında olsa bile çizgi kaybolmasın
+            row.set_progress(progress_map.get(tab))
             row.activated.connect(lambda t=tab: self._activate_tab_from_sidebar(t))
             row.close_requested.connect(lambda t=tab: self.close_tab(self.tab_widget.indexOf(t)))
             row.pin_toggle_requested.connect(lambda t=tab: self._toggle_pin_tab(t))
+            self._sidebar_rows[tab] = row
             (pinned_rows if pinned else normal_rows).append(row)
 
-        insert_at = 1 
+        insert_at = 1
         for row in pinned_rows + normal_rows:
             self._sidebar_layout.insertWidget(insert_at, row)
             insert_at += 1
@@ -1791,17 +1507,29 @@ class MainWindow(QMainWindow):
                 attempts -= 1
                 mode = "unlock"
                 show_modern_info(self, "Yanlış ana parola." if self.lang == "tr" else "Wrong master password.", lang=self.lang, warning=True)
+            except CorruptVault as exc:
+                # Bozuk meta dosyası: parolayı tekrar sormak çözüm değil,
+                # yakalanmayan istisna da uygulamayı çökertiyordu.
+                msg = ("Şifre kasası meta dosyası bozuk; kasa açılamadı. Detay: " if self.lang == "tr"
+                       else "The vault metadata file is corrupt; the vault cannot be opened. Detail: ") + str(exc)
+                show_modern_info(self, msg, lang=self.lang, warning=True)
+                return False
         return False
 
     def _reset_vault_lock_timer(self):
-        if self.vault is not None: self.vault_lock_timer.start()
+        # "Oturum boyunca açık kalsın" seçiliyken otomatik kilitleme yok:
+        # kasa yalnızca tarayıcı kapatılınca iner.
+        if self.vault is not None and not self.settings.current.get("vault_session_unlock", False):
+            self.vault_lock_timer.start()
 
     def _lock_vault(self):
         if self.vault is not None: self.vault = None
 
     def _open_password_manager(self):
         if self.is_incognito or not self._ensure_vault_unlocked(): return
-        PasswordManagerDialog(self.vault, self).exec()
+        dlg = PasswordManagerDialog(self.vault, self)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.exec()
         self._reset_vault_lock_timer()
 
     def add_new_tab(self, url: QUrl = None, switch_to: bool = True):
@@ -1813,32 +1541,36 @@ class MainWindow(QMainWindow):
             lang=self.lang,
             new_page_callback=self._create_page_for_new_window
         )
-        
+
         bg_col = QColor("#f5f5f5" if self.settings.current["ui_theme"] == "light" else "#1a1a1a")
         if getattr(tab, "view", None) and tab.view.page():
             tab.view.page().setBackgroundColor(bg_col)
-            
+
         index = self.tab_widget.addTab(tab, "Yeni Sekme" if self.lang == "tr" else "New Tab")
         bar = self.tab_widget.tabBar()
         if isinstance(bar, ProgressTabBar): bar.animate_tab_in(tab)
-        
-        timer = QTimer(self)
-        timer.setSingleShot(True)
-        timer.setInterval((2 if self.settings.current.get("low_ram_mode", False) else 4) * 60 * 1000)
-        timer.timeout.connect(lambda t=tab: self._auto_suspend_tab(t))
-        self.tab_timers[tab] = timer
+
+        interval_ms = self._suspend_interval_ms()
+        if interval_ms > 0:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(interval_ms)
+            timer.timeout.connect(lambda t=tab: self._auto_suspend_tab(t))
+            self.tab_timers[tab] = timer
 
         tab.title_changed.connect(lambda title, t=tab: self._update_tab_title(t, title))
         tab.url_changed.connect(lambda u, t=tab: self._update_tab_url(t, u))
         tab.gem_action_triggered.connect(lambda u, t=tab: self._handle_gem_action(t, u))
+        tab.pdf_open_requested.connect(lambda u, t=tab: self._open_pdf_flow(t, u))
+        tab.audio_state_changed.connect(lambda m, a, t=tab: self._update_tab_audio(t, m, a))
         tab.icon_changed.connect(lambda icon, t=tab: self._update_tab_icon(t, icon))
-        tab.load_finished.connect(lambda ok, t=tab: self._attempt_autofill(t) if ok else None)
+        tab.load_finished.connect(lambda ok, t=tab: self._schedule_autofill_check(t, ok))
         tab.load_finished.connect(lambda ok, t=tab: self._update_tab_progress(t, None))
         tab.load_finished.connect(lambda ok, t=tab: self._record_history(t) if ok else None)
         tab.load_progress.connect(lambda val, t=tab: self._update_tab_progress(t, val))
         tab.url_changed.connect(lambda u, t=tab: self._update_nav_buttons() if t == self.current_tab() else None)
         tab.load_finished.connect(lambda ok, t=tab: self._update_nav_buttons() if t == self.current_tab() else None)
-        
+
         self.tab_widget.setTabIcon(index, self._app_icon())
         self.tab_widget.tabBar().setTabButton(index, QTabBar.ButtonPosition.RightSide, self._make_close_button(tab))
 
@@ -1846,6 +1578,7 @@ class MainWindow(QMainWindow):
             self.tab_widget.setCurrentIndex(index)
             self._update_nav_buttons()
         self._rebuild_vertical_sidebar()
+        self._enforce_max_live_tabs()
         return tab
 
     def _make_close_button(self, tab: BrowserTab) -> QToolButton:
@@ -1878,6 +1611,83 @@ class MainWindow(QMainWindow):
         bar = self.tab_widget.tabBar()
         if isinstance(bar, ProgressTabBar):
             bar.set_progress(tab, None if value is not None and value >= 100 else value)
+        # Dikey sidebar'daki yükleme çizgisi: yatay bar ile birebir aynı değer
+        row = self._sidebar_rows.get(tab)
+        if row is not None:
+            try:
+                row.set_progress(None if value is not None and value >= 100 else value)
+            except RuntimeError:
+                # satır az önce deleteLater edilmiş olabilir
+                self._sidebar_rows.pop(tab, None)
+
+    def _open_pdf_flow(self, tab, url: QUrl):
+        """PDF gezinmesi: yerel dosya doğrudan görüntüleyicide; uzak PDF
+        Qt tarafında sessizce indirilip (CORS'suz) yerel kopyadan açılır.
+        (tab, url) — pdf_open_requested sinyalinden gelir."""
+        if self.tab_widget.indexOf(tab) == -1:
+            return
+        if tab.is_suspended:
+            tab.restore()
+        if tab.view is None:
+            return
+
+        if url.scheme() == "file":
+            local = url.toLocalFile()
+            if not local or not os.path.exists(local):
+                show_modern_info(
+                    self,
+                    "Dosya bulunamadı." if self.lang == "tr" else "File not found.",
+                    lang=self.lang, warning=True)
+                return
+            target = pdf_viewer.build_viewer_url(url.toString())
+            if target:
+                tab.view.load(QUrl(target))
+            return
+
+        # http/https: arka planda indir. Bekleyen istek işareti: indirme
+        # sürerken kullanıcı başka sayfaya giderse, indirme bitince
+        # görüntüleyici yeni sayfanın ÜSTÜNE yüklenmesin.
+        tab._gem_pdf_pending = url.toString()
+        tab._gem_pdf_fetching = True
+        if not hasattr(self, "_pdf_fetch_threads"):
+            self._pdf_fetch_threads = []
+        # bitenleri temizle (referans birikmesin)
+        self._pdf_fetch_threads = [t for t in self._pdf_fetch_threads if t.isRunning()]
+        thread = PdfFetchThread(url.toString(), self)
+        self._pdf_fetch_threads.append(thread)
+        thread.done_ok.connect(
+            lambda src, path, t=tab: self._on_pdf_fetched(t, src, path))
+        thread.done_err.connect(
+            lambda src, err, t=tab: self._on_pdf_fetch_failed(t, src, err))
+        thread.start()
+
+    def _on_pdf_fetched(self, tab, source_url: str, local_path: str):
+        if self.tab_widget.indexOf(tab) == -1:
+            return
+        tab._gem_pdf_fetching = False
+        if getattr(tab, "_gem_pdf_pending", None) != source_url:
+            return  # kullanıcı bu isteği beklemiyor artık (baska sayfaya gitti)
+        tab._gem_pdf_pending = None
+        if tab.is_suspended:
+            tab.restore()
+        if tab.view is None:
+            return
+        from urllib.parse import unquote as _unquote
+        display = _unquote(os.path.basename(QUrl(source_url).path())) or "belge.pdf"
+        target = pdf_viewer.build_viewer_url(
+            QUrl.fromLocalFile(local_path).toString(), display_name=display,
+            download_url=source_url)
+        if target:
+            tab.view.load(QUrl(target))
+
+    def _on_pdf_fetch_failed(self, tab, source_url: str, error: str):
+        if self.tab_widget.indexOf(tab) == -1:
+            return
+        tab._gem_pdf_fetching = False
+        if getattr(tab, "_gem_pdf_pending", None) == source_url:
+            tab._gem_pdf_pending = None
+        msg = ("PDF indirilemedi: " if self.lang == "tr" else "Could not download the PDF: ") + error
+        show_modern_info(self, msg, lang=self.lang, warning=True)
 
     def _handle_gem_action(self, tab, url):
         url_str = url.toString()
@@ -1897,26 +1707,94 @@ class MainWindow(QMainWindow):
                     save_bookmarks([b for b in bookmarks if b["url"] != b_url])
                     self._refresh_new_tab_page(tab)
 
-    def keyPressEvent(self, event):
-        if event.matches(QKeySequence.StandardKey.Find):
-            tab = self.current_tab()
-            if tab and not tab.is_suspended: tab.show_find_bar()
-        elif event.key() == Qt.Key.Key_F5 or event.matches(QKeySequence.StandardKey.Refresh):
-            self._reload_page()
-        else:
-            super().keyPressEvent(event)
+    def _find_in_page(self):
+        tab = self.current_tab()
+        if isinstance(tab, BrowserTab) and not tab.is_suspended:
+            tab.show_find_bar()
 
-    def _auto_suspend_tab(self, tab):
-        if tab.is_suspended or tab == self.current_tab(): return
+    def _toggle_window_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+            # Tam ekrana geçmeden önce ekranı kaplıyorsa o haline dön.
+            if getattr(self, "_was_maximized", False):
+                self.showMaximized()
+        else:
+            self._was_maximized = self.isMaximized()
+            self.showFullScreen()
+
+    def _suspend_interval_ms(self) -> int:
+        """Ayarlanan uyutma süresinin milisaniye karşılığı; 0 = asla
+        uyutma. Düşük RAM modu süreyi yarıya indirir (4 dk -> 2 dk,
+        eski davranışla uyumlu)."""
+        try:
+            mins = float(self.settings.current.get("tab_suspend_minutes", 4.0))
+        except (TypeError, ValueError):
+            mins = 4.0
+        if mins <= 0:
+            return 0
+        if self.settings.current.get("low_ram_mode", False):
+            mins /= 2.0
+        return int(mins * 60 * 1000)
+
+    def _update_suspend_timers(self):
+        """Ayar değişince mevcut sekmelerin uyutma zamanlayıcılarını
+        (yeni süreye güncelle / tamamen kaldır / eksikse oluştur)."""
+        interval_ms = self._suspend_interval_ms()
+        for i in range(self.tab_widget.count()):
+            tab = self.tab_widget.widget(i)
+            if not isinstance(tab, BrowserTab):
+                continue
+            timer = self.tab_timers.get(tab)
+            if interval_ms <= 0:
+                if timer is not None:
+                    timer.stop()
+                    del self.tab_timers[tab]
+            else:
+                if timer is None:
+                    timer = QTimer(self)
+                    timer.setSingleShot(True)
+                    timer.timeout.connect(lambda t=tab: self._auto_suspend_tab(t))
+                    self.tab_timers[tab] = timer
+                timer.setInterval(interval_ms)
+
+    def _enforce_max_live_tabs(self):
+        """Canlı sekme sınırı: sınır aşılırsa EN ESKİ arka plan sekmeleri
+        anında uyutulur. Video oynatan sekmeler _auto_suspend_tab
+        tarafından atlanır. Adaylar sekme çubuğu sırasından okunur —
+        tab_timers'a BAKMA: 'asla uyutma' modunda zamanlayıcı hiç
+        oluşturulmaz ve sınır mekanizması aday bulamazdı."""
+        try:
+            limit = int(self.settings.current.get("max_live_tabs", 0))
+        except (TypeError, ValueError):
+            limit = 0
+        if limit <= 0:
+            return
+        current = self.current_tab()
+        bg_live = []
+        for i in range(self.tab_widget.count()):
+            t = self.tab_widget.widget(i)
+            if (isinstance(t, BrowserTab) and t is not current
+                    and not t.is_suspended and t.view is not None):
+                bg_live.append(t)
+        total_live = len(bg_live) + (1 if isinstance(current, BrowserTab) and not current.is_suspended else 0)
+        while total_live > limit and bg_live:
+            victim = bg_live.pop(0)
+            if self._auto_suspend_tab(victim):
+                total_live -= 1
+
+    def _auto_suspend_tab(self, tab) -> bool:
+        if tab.is_suspended or tab == self.current_tab():
+            return False
         if tab.view is not None and tab.web_page is not None and tab.web_page.recentlyAudible():
             if tab in self.tab_timers: self.tab_timers[tab].start()
-            return
+            return False
         tab.suspend()
         index = self.tab_widget.indexOf(tab)
         if index != -1:
             self.tab_widget.setTabIcon(index, gem_icons.get_icon("moon", "#8a8a8a"))
         self._update_sleep_status()
         self._rebuild_vertical_sidebar()
+        return True
 
     def _update_sleep_status(self):
         if not hasattr(self, "tab_widget") or not hasattr(self, "sleep_status_label"):
@@ -1941,36 +1819,211 @@ class MainWindow(QMainWindow):
 
     def _update_tab_icon(self, tab: BrowserTab, icon: QIcon):
         index = self.tab_widget.indexOf(tab)
-        if index != -1: 
-            if tab.view.url().toString().startswith("file://") and "gem_browser_new_tab" in tab.view.url().toString(): icon = self._app_icon()
+        if index != -1:
+            # Sıra dışı durumlarda (suspend/cleanup sonrası gelen kuyruktaki
+            # sinyal) view None olabilir; silinmiş nesneye dokunma.
+            url_str = tab.saved_url.toString() if tab.is_suspended else (tab.view.url().toString() if tab.view is not None else "")
+            if _is_gem_internal_page(url_str):
+                icon = self._app_icon()
+            elif icon is None or icon.isNull():
+                # favicon'suz harici sayfa: boş ikon yerine soluk küre
+                muted_col = "#777777" if self.settings.current["ui_theme"] == "light" else "#999999"
+                icon = gem_icons.get_icon("globe", muted_col, size=16)
+            # Ses göstergesi kapalıyken geri dönülebilsin diye son "normal"
+            # ikonu sakla.
+            tab._gem_base_icon = QIcon(icon)
             self.tab_widget.setTabIcon(index, icon)
-            self._rebuild_vertical_sidebar()
+            row = self._sidebar_rows.get(tab)
+            if row is not None:
+                try:
+                    row.set_icon(icon)
+                except RuntimeError:
+                    self._sidebar_rows.pop(tab, None)
+                    self._rebuild_vertical_sidebar()
 
-    def _attempt_autofill(self, tab: BrowserTab):
-        if tab.is_suspended or tab.view is None or self.is_incognito or self.vault is None: return
-        if tab.view.url().scheme() not in ("http", "https"): return
-        creds = self.vault.get_credentials_for_url(tab.view.url().toString())
-        if creds:
-            tab.web_page.runJavaScript(f"(function() {{ var pwdInputs = document.querySelectorAll('input[type=\"password\"]'); if (pwdInputs.length > 0) {{ var p = pwdInputs[0]; p.value = {json.dumps(creds['password'])}; var allInputs = document.querySelectorAll('input:not([type=\"hidden\"])'); for (var i = 0; i < allInputs.length; i++) {{ if (allInputs[i] === p && i > 0) {{ allInputs[i - 1].value = {json.dumps(creds['username'])}; break; }} }} }} }})();")
-            self._reset_vault_lock_timer()
+    # ---------------- Otomatik doldurma (teklif tabanlı) ----------------
+
+    def _tab_is_live(self, tab) -> bool:
+        """Zamanlanmış yoklama/gecikme penceresi içinde sekme kapatılmış
+        olabilir: silinmiş C++ nesnesine dokunmadan yaşadığını doğrula.
+        (Kapatılan sekmenin 400/2000/5000 ms'lik doldurma yoklamaları
+        ateşlenmeye devam ediyordu ve silinmiş BrowserTab'a erişim
+        RuntimeError -> qFatal ile uygulamayı düşürüyordu.)"""
+        try:
+            return (isinstance(tab, BrowserTab)
+                    and self.tab_widget.indexOf(tab) != -1
+                    and not tab.is_suspended
+                    and tab.view is not None)
+        except RuntimeError:
+            return False
+
+    def _schedule_autofill_check(self, tab: BrowserTab, ok: bool):
+        """Sayfa yüklendiğinde şifre alanlarını birkaç aşamada yokla:
+        SPA'larda form sayfa yüklendikten SONRA DOM'a ekleniyor; tek deneme
+        kaçırıyordu. Her yeni yükleme teklif hakkını sıfırlar."""
+        if not ok or tab.is_suspended or tab.view is None:
+            return
+        url_str = tab.view.url().toString()
+        if not (url_str.startswith("http://") or url_str.startswith("https://")):
+            return
+        tab._gem_autofill_offered_url = None
+        for delay in (400, 2000, 5000):
+            QTimer.singleShot(delay, lambda t=tab, u=url_str: self._autofill_probe(t, u))
+
+    def _autofill_probe(self, tab: BrowserTab, expected_url: str):
+        if not self._tab_is_live(tab):
+            return  # sekme bu süreçte kapatılmış/gecikmiş
+        try:
+            if tab.view.url().toString() != expected_url:
+                return  # kullanıcı bu sırada başka yere gitti
+            tab.view.page().runJavaScript(
+                "document.querySelectorAll('input[type=password]').length",
+                lambda n: self._autofill_password_fields_found(tab, expected_url, n))
+        except RuntimeError:
+            pass  # sekme ara olayda silindiyse sessizce çık
+
+    def _autofill_password_fields_found(self, tab: BrowserTab, url: str, count):
+        try:
+            count = int(count) if count is not None else 0
+        except (TypeError, ValueError):
+            return
+        if count <= 0 or not self._tab_is_live(tab):
+            return
+        try:
+            if tab.view.url().toString() != url:
+                return
+        except RuntimeError:
+            return  # sekme ara olayda silindi
+        if getattr(tab, "_gem_autofill_offered_url", None) == url:
+            return  # bu yükleme için teklif gösterildi
+        if self.is_incognito:
+            return
+        # Kasa kilitliyse (normalde 10 dk sonra kilitlenir) açılmasını TEKLİF ET
+        if self.vault is None:
+            if not vault_exists():
+                return
+            ok = show_modern_confirm(
+                self,
+                "Bu sayfada bir oturum formu algılandı. Kayıtlı şifreniz "
+                "kasada saklı olabilir; doldurmak için kasanın kilidini açın."
+                if self.lang == "tr" else
+                "A login form was detected on this page. Your saved password "
+                "may be in the vault; unlock the vault to fill it.",
+                title="Şifre Otomatik Doldurma" if self.lang == "tr" else "Autofill Password",
+                lang=self.lang)
+            if not ok:
+                tab._gem_autofill_offered_url = url
+                return
+            if not self._ensure_vault_unlocked():
+                tab._gem_autofill_offered_url = url
+                return
+
+        creds = self.vault.get_credentials_for_url(url)
+        if not creds:
+            return  # bu site için kayıt yok: sessizce geç
+
+        tab._gem_autofill_offered_url = url
+        accepted = show_modern_confirm(
+            self,
+            (f"{creds['username']} hesabı için kayıtlı şifre bulundu.\n"
+             "Bu sayfadaki oturum formuna doldurulsun mu?")
+            if self.lang == "tr" else
+            (f"A saved password was found for {creds['username']}.\n"
+             "Fill it into the login form on this page?"),
+            title="Şifre Otomatik Doldurma" if self.lang == "tr" else "Autofill Password",
+            lang=self.lang)
+        if not accepted:
+            return
+        self._fill_login_form(tab, creds["username"], creds["password"])
+        self._reset_vault_lock_timer()
+
+    def _fill_login_form(self, tab: BrowserTab, username: str, password: str):
+        """Şifreyi + kullanıcı adını doldurur. input/change olaylarını da
+        tetikler (React/Vue gibi framework'ler value atamasını yok sayar)."""
+        if not self._tab_is_live(tab):
+            return
+        try:
+            tab.view.page().runJavaScript(f"""(function() {{
+            function setVal(el, v) {{
+                el.value = v;
+                el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                el.dispatchEvent(new Event('change', {{bubbles: true}}));
+            }}
+            var pw = document.querySelector('input[type=password]');
+            if (!pw) return;
+            setVal(pw, {json.dumps(password)});
+            var user = null;
+            var form = pw.closest('form');
+            if (form) {{
+                user = form.querySelector('input[type=email], input[type=text], input[type=tel], input:not([type])');
+            }}
+            if (!user) {{
+                var els = document.querySelectorAll('input[type=email], input[type=text], input:not([type])');
+                for (var i = 0; i < els.length; i++) {{
+                    if (els[i].type === 'hidden') continue;
+                    // DOM sırasında şifre alanından ÖNCE gelen son uygun alan
+                    if (els[i].compareDocumentPosition(pw) & Node.DOCUMENT_POSITION_FOLLOWING) user = els[i];
+                }}
+            }}
+            if (user) setVal(user, {json.dumps(username)});
+        }})();""")
+        except RuntimeError:
+            pass
 
     def close_tab(self, index: int):
+        if self.tab_widget.count() <= 1:
+            # --- SON SEKME ---
+            widget = (self.tab_widget.widget(index)
+                      if index != -1 else self.tab_widget.currentWidget())
+            if widget is None:
+                widget = self.tab_widget.currentWidget()
+            url_str = ""
+            if isinstance(widget, BrowserTab):
+                url_str = (widget.saved_url.toString() if widget.is_suspended
+                           else (widget.view.url().toString() if widget.view is not None else ""))
+            is_new_tab_page = "gem_browser_new_tab" in url_str
+            if isinstance(widget, BrowserTab) and not is_new_tab_page:
+                # Son sekme İÇERİK sekmesi: tarayıcıyı KAPATMA — yerine boş
+                # bir yeni sekme aç ve onu kapat (Chrome davranışı).
+                self.add_new_tab()  # switch_to=True: yeni sekme öne gelir
+                old_index = self.tab_widget.indexOf(widget)
+                if old_index != -1:
+                    self.close_tab(old_index)  # artık çoklu-sekme yoluyla sorunsuz kapanır
+                return
+            # Son sekme zaten "Yeni Sekme": kapatma uyarısı BURADA çıkar.
+            if show_modern_confirm(
+                    self,
+                    "Bu sekmeyi kapatırsanız tarayıcı da kapanacaktır. Emin misiniz?"
+                    if self.lang == "tr" else
+                    "Closing this tab will also close the browser. Are you sure?",
+                    title="Son sekmeyi kapat" if self.lang == "tr" else "Close last tab",
+                    lang=self.lang, danger=True):
+                self.close()
+            return
         if self.tab_widget.count() > 1:
             widget = self.tab_widget.widget(index)
             def _do_remove(widget=widget):
-                if isinstance(widget, BrowserTab):
-                    url_str = widget.saved_url.toString() if widget.is_suspended else widget.view.url().toString()
-                    if url_str and not (url_str.startswith("file://") and "gem_browser_new_tab" in url_str):
-                        self.closed_tabs_stack.append(url_str)
-                        del self.closed_tabs_stack[:-20]
-                if widget in self.tab_timers:
-                    self.tab_timers[widget].stop()
-                    del self.tab_timers[widget]
-                bar2 = self.tab_widget.tabBar()
-                if isinstance(bar2, ProgressTabBar): bar2.set_progress(widget, None)
+                # Animasyonlu kapatmada hızlı çift tık, ilk animasyonun
+                # stop() edilip finished sinyalinin HEMEN yayılmasına yol
+                # açar; _do_remove iki kez tetiklenirse ikinci çağrı silinmiş
+                # C++ nesnesi üzerinde indexOf/removeTab yapıp RuntimeError
+                # ile çöker. Bu yüzden sekme gerçekten hâlâ listedeyken
+                # işle, temizliği de yalnızca bir kez yap.
                 current_index = self.tab_widget.indexOf(widget)
-                if current_index != -1: self.tab_widget.removeTab(current_index)
-                if isinstance(widget, BrowserTab):
+                if current_index != -1:
+                    if isinstance(widget, BrowserTab):
+                        url_str = widget.saved_url.toString() if widget.is_suspended else widget.view.url().toString()
+                        if url_str and not (_is_gem_internal_page(url_str)):
+                            self.closed_tabs_stack.append(url_str)
+                            del self.closed_tabs_stack[:-20]
+                    if widget in self.tab_timers:
+                        self.tab_timers[widget].stop()
+                        del self.tab_timers[widget]
+                    bar2 = self.tab_widget.tabBar()
+                    if isinstance(bar2, ProgressTabBar): bar2.set_progress(widget, None)
+                    self.tab_widget.removeTab(current_index)
+                if isinstance(widget, BrowserTab) and not getattr(widget, "_gem_cleaned", False):
+                    widget._gem_cleaned = True
                     widget.cleanup()
                     widget.deleteLater()
                 self._update_sleep_status()
@@ -2003,12 +2056,40 @@ class MainWindow(QMainWindow):
                 else:
                     if not tab.is_suspended and timer and not timer.isActive(): timer.start()
 
-        current_url = current_tab.saved_url.toString() if current_tab.is_suspended else current_tab.view.url().toString()
-        if current_url.startswith("file://") and "gem_browser_new_tab" in current_url: self.url_bar.clear()
+        current_url = current_tab.saved_url.toString() if current_tab.is_suspended else (current_tab.view.url().toString() if current_tab.view is not None else "")
+        if _is_gem_internal_page(current_url): self.url_bar.clear()
         else: self._set_url_bar_text(current_url)
         self._update_nav_buttons()
         if woke_up: self._update_sleep_status()
         self._rebuild_vertical_sidebar()
+
+        current_full_title = getattr(current_tab, "_gem_full_title", None)
+        is_new_tab = _is_gem_internal_page(current_url)
+        self._update_window_title(None if is_new_tab else current_full_title)
+        self._update_url_extras()
+        # Uyuyan sekme uyandırıldıysa canlı sayısı arttı; sınırı uygula.
+        self._enforce_max_live_tabs()
+        # Seçim vurgusunu satırlarda yerinde güncelle (sekme değişiminde tüm
+        # sidebar'ı yeniden kurmak gereksizdi).
+        for t, row in self._sidebar_rows.items():
+            try:
+                row.set_selected(t is current_tab)
+            except RuntimeError:
+                pass
+        # Eski sekmelerde bekleyen izin kartları: sekme değişince reddet
+        # (Chrome davranışı — baloncuk yalnızca kendi sekmesinde yaşar).
+        for i in range(self.tab_widget.count()):
+            t = self.tab_widget.widget(i)
+            if isinstance(t, BrowserTab) and t is not current_tab:
+                t._close_all_permission_popups()
+
+    def _update_window_title(self, title: str = None):
+        # Görev çubuğu / Alt+Tab önizlemesinde aktif sekmenin sayfa başlığı
+        # görünsün diye, sabit "GEM Browser" yerine "Sayfa Başlığı - GEM
+        # Browser" formatını kullanıyoruz (diğer tarayıcılardaki standart
+        # davranış budur). Başlık yoksa (örn. yeni sekme) sadece uygulama
+        # adına dönüyoruz.
+        self.setWindowTitle(f"{title} - {self._base_title}" if title else self._base_title)
 
     def _update_tab_title(self, tab: BrowserTab, title: str):
         index = self.tab_widget.indexOf(tab)
@@ -2017,31 +2098,428 @@ class MainWindow(QMainWindow):
         full_title = title or default_title
         short_title = (title[:25] + "..." if len(title) > 25 else title) or default_title
         tab._gem_full_title = full_title
-        
-        self.tab_widget.setTabToolTip(index, "") 
-        
+
+        self.tab_widget.setTabToolTip(index, "")
+
         pinned = bool(tab.property("pinned"))
         self.tab_widget.setTabText(index, "" if pinned else short_title)
-        self._rebuild_vertical_sidebar()
+        # Dikey sidebar: tam yeniden kurulum yerine satırda yerinde başlık
+        # güncelle (her başlık değişiminde tüm satır widget'ları yeniden
+        # yaratılıyordu — dikey moddaki en büyük takılma kaynağıydı).
+        row = self._sidebar_rows.get(tab)
+        if row is not None:
+            try:
+                row.set_title(full_title)
+            except RuntimeError:
+                self._sidebar_rows.pop(tab, None)
+                self._rebuild_vertical_sidebar()
+        else:
+            self._rebuild_vertical_sidebar()
+
+        if tab == self.current_tab():
+            self._update_window_title(full_title)
 
     def _update_tab_url(self, tab: BrowserTab, url: QUrl):
-        if tab == self.current_tab() and not (url.toString().startswith("file://") and "gem_browser_new_tab" in url.toString()):
+        # Bekleyen uzak-PDF isteği varken BAŞKA bir sayfaya gezinildi:
+        # indirme bitse bile görüntüleyici o sayfanın üstüne yüklenmesin.
+        # DİKKAT: urlChanged, acceptNavigationRequest ile ENGELLENMİŞ pdf
+        # gezinmesi için de ateşlenir — bekleyen URL'in kendisi geldiğinde
+        # işareti SİLME (aksi halde indirme bitince görüntüleyici hiç
+        # yüklenmezdi).
+        pending = getattr(tab, "_gem_pdf_pending", None)
+        if pending and url.toString() != pending and not _is_gem_internal_page(url.toString()):
+            # Koşuldaki internal-page muafiyeti: engellenen pdf gezinmesi
+            # sonrası Chromium önceki sayfaya dönerken de urlChanged yayılır
+            # (dahili sayfa) — bu geri-dönüş olayı bekleyen isteği SİLMEMELİ.
+            tab._gem_pdf_pending = None
+        # Otomatik doldurma teklifi: farklı bir adrese gezinildiğinde hakkı
+        # sıfırlanır (kullanıcı çıkış yapıp aynı login sayfasına dönerse
+        # tekrar teklif edilebilsin).
+        offered = getattr(tab, "_gem_autofill_offered_url", None)
+        if offered and url.toString() != offered:
+            tab._gem_autofill_offered_url = None
+        # İç sayfalara (yeni sekme / PDF görüntüleyici) dönüşte favicon
+        # GERİ GELMEZ (favicon'suz sayfa) — Qt'nin boş iconChanged'i
+        # urlChanged'den önce geldiğinde ikon boşalıp öyle kalıyordu.
+        # urlChanged, sıralamada en sonda gelen güvenilir noktadır: ikonu
+        # burada kesin olarak uygulama ikonuna döndür.
+        if _is_gem_internal_page(url.toString()) and not tab.is_suspended:
+            index = self.tab_widget.indexOf(tab)
+            if index != -1:
+                if getattr(tab, "_muted", False):
+                    icon = gem_icons.get_icon("volume-off", "#e67e22", size=16)
+                else:
+                    icon = self._app_icon()
+                tab._gem_base_icon = QIcon(icon)
+                self.tab_widget.setTabIcon(index, icon)
+                row = self._sidebar_rows.get(tab)
+                if row is not None:
+                    try:
+                        row.set_icon(icon)
+                    except RuntimeError:
+                        self._sidebar_rows.pop(tab, None)
+        if tab == self.current_tab() and not (_is_gem_internal_page(url.toString())):
             self._set_url_bar_text(url.toString())
+        if tab == self.current_tab():
+            self._update_url_extras()
+
+    def _current_page_url(self) -> QUrl:
+        """Aktif sekmenin URL'si; askıdaysa kayıtlı adresi, yoksa boş QUrl."""
+        tab = self.current_tab()
+        if not isinstance(tab, BrowserTab):
+            return QUrl("")
+        if tab.is_suspended:
+            return QUrl(getattr(tab, "saved_url", QUrl("")))
+        if tab.view is not None:
+            return tab.view.url()
+        return QUrl("")
+
+    def _update_url_extras(self):
+        """Adres çubuğunun güvenlik göstergesini (kilit) ve favori
+        yıldızını, o anki sayfaya göre günceller."""
+        url = self._current_page_url()
+        url_str = url.toString()
+        is_new_tab_page = _is_gem_internal_page(url_str)
+        is_page = bool(url_str) and url_str != "about:blank" and not is_new_tab_page
+        accent = gem_theme.get_accent_color(self.settings.current)
+        is_light = self.settings.current["ui_theme"] == "light"
+
+        scheme = url.scheme()
+        if is_page and scheme in ("http", "https"):
+            self.security_action.setVisible(True)
+            if scheme == "https":
+                # left_pad: ikon alanın en soluna yapışık durmasın, içeride
+                # nefes alan bir konumda dursun (kullanıcı isteği).
+                self.security_action.setIcon(gem_icons.get_icon("lock", accent, size=14))
+                self.security_action.setToolTip(
+                    "Güvenli bağlantı (HTTPS)" if self.lang == "tr" else "Secure connection (HTTPS)")
+            else:
+                self.security_action.setIcon(gem_icons.get_icon("lock", "#e67e22", size=14))
+                self.security_action.setToolTip(
+                    "Güvensiz bağlantı (HTTP)" if self.lang == "tr" else "Not secure (HTTP)")
+        else:
+            self.security_action.setVisible(False)
+
+        if is_page:
+            self.star_action.setVisible(True)
+            bookmarks = load_bookmarks()
+            is_bookmarked = any(b.get("url") == url_str for b in bookmarks)
+            if is_bookmarked:
+                self.star_action.setIcon(gem_icons.get_icon("star", accent, size=16))
+                self.star_action.setToolTip(
+                    "Favorilerden kaldır" if self.lang == "tr" else "Remove from bookmarks")
+            else:
+                muted = "#777777" if is_light else "#888888"
+                self.star_action.setIcon(gem_icons.get_icon("star", muted, size=16))
+                self.star_action.setToolTip(
+                    "Favorilere ekle" if self.lang == "tr" else "Add to bookmarks")
+        else:
+            self.star_action.setVisible(False)
+
+    def _toggle_bookmark(self):
+        """Adres çubuğundaki yıldız: o anki sayfayı favorilere ekler/kaldırır."""
+        url = self._current_page_url()
+        url_str = url.toString()
+        if not url_str or url_str == "about:blank":
+            return
+        bookmarks = load_bookmarks()
+        if any(b.get("url") == url_str for b in bookmarks):
+            bookmarks = [b for b in bookmarks if b.get("url") != url_str]
+        else:
+            tab = self.current_tab()
+            title = ""
+            if isinstance(tab, BrowserTab):
+                title = getattr(tab, "_gem_full_title", "") or (tab.view.title() if tab.view is not None else "")
+            bookmarks.append({"name": title or url_str, "url": url_str})
+        save_bookmarks(bookmarks)
+        self._update_url_extras()
+        # Açık olan yeni sekme sayfaları güncel favorileri görsün.
+        for i in range(self.tab_widget.count()):
+            t = self.tab_widget.widget(i)
+            if isinstance(t, BrowserTab) and not t.is_suspended and t.view is not None:
+                cur = t.view.url().toString()
+                if cur.startswith("file://") and "gem_browser_new_tab" in cur:
+                    self._refresh_new_tab_page(t)
+
+    def _show_security_info(self):
+        url = self._current_page_url()
+        host = url.host() or (url.toString()[:40] if url.toString() else "")
+        if url.scheme() == "https":
+            msg = (f"{host} güvenli bir HTTPS bağlantısı üzerinden yükleniyor. "
+                   "Sitenin kimliği doğrulanır ve trafik şifrelenir.") if self.lang == "tr" else \
+                  (f"{host} is loaded over a secure HTTPS connection. "
+                   "Its identity is verified and traffic is encrypted.")
+            title = "Güvenli Bağlantı" if self.lang == "tr" else "Secure Connection"
+        else:
+            msg = (f"{host} şifrelenmemiş bir HTTP bağlantısı üzerinden yükleniyor. "
+                   "Verileriniz ağ üzerinde düz metin taşınabilir; gizli bilgilerinizi girmeyin.") if self.lang == "tr" else \
+                  (f"{host} is loaded over an unencrypted HTTP connection. "
+                   "Your data travels in plain text; avoid entering sensitive information.")
+            title = "Güvensiz Bağlantı" if self.lang == "tr" else "Not Secure"
+        show_modern_info(self, msg, title=title, lang=self.lang, warning=(url.scheme() != "https"))
+
+    def _open_file_dialog(self):
+        """Ctrl+O: yerel dosya seçip sekmede aç (PDF'ler görüntüleyicide)."""
+        lang = self.lang
+        filter_str = ("PDF (*.pdf);;HTML (*.htm *.html);;Tüm Dosyalar (*)"
+                      if lang == "tr" else
+                      "PDF (*.pdf);;HTML (*.htm *.html);;All Files (*)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Dosya Aç" if lang == "tr" else "Open File",
+            os.path.expanduser("~"), filter_str)
+        if path:
+            self._open_local_path(path)
+
+    def _open_local_path(self, path: str, tab=None):
+        """Yerel dosyayı sekmede aç: PDF'ler görüntüleyicide, diğerleri
+        doğrudan (file://) gezinilir."""
+        if tab is None:
+            tab = self.current_tab()
+        if not isinstance(tab, BrowserTab):
+            tab = self.add_new_tab(QUrl("about:blank"))
+        if tab.is_suspended:
+            tab.restore()
+        if tab.view is None:
+            return
+        if path.lower().endswith(".pdf"):
+            target = pdf_viewer.build_viewer_url(QUrl.fromLocalFile(path).toString())
+            if target:
+                tab.view.load(QUrl(target))
+                return
+        tab.view.setUrl(QUrl.fromLocalFile(path))
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if not urls:
+            return super().dropEvent(event)
+        first = True
+        for u in urls:
+            local = u.toLocalFile()
+            if local:
+                if first:
+                    # İlk dosya geçerli sekmede, kalanlar yeni sekmelerde
+                    self._open_local_path(local)
+                    first = False
+                else:
+                    new_tab = self.add_new_tab(QUrl("about:blank"))
+                    self._open_local_path(local, tab=new_tab)
+            elif u.toString().startswith(("http://", "https://")):
+                tab = self.current_tab()
+                if isinstance(tab, BrowserTab) and tab.view is not None:
+                    tab.view.setUrl(u)
+        event.acceptProposedAction()
+
+    # ---------------- Sayfa/sekme eylemleri ----------------
+
+    def _active_page_tab(self):
+        """Eylemlerin uygulanacağı (görünür, askıda olmayan) sekmeyi döndürür."""
+        tab = self.current_tab()
+        if isinstance(tab, BrowserTab) and not tab.is_suspended and tab.view is not None:
+            return tab
+        return None
+
+    def _toggle_devtools(self):
+        tab = self._active_page_tab()
+        if tab is not None:
+            tab.toggle_devtools()
+
+    def _print_page(self):
+        if QPrinter is None:
+            show_modern_info(self, "Yazdırma modülü (QtPrintSupport) kurulu değil.",
+                             lang=self.lang, warning=True)
+            return
+        tab = self._active_page_tab()
+        if tab is None:
+            return
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        dlg = QPrintDialog(printer, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            tab.view.page().print(printer)
+
+    def _save_page_as_pdf(self):
+        tab = self._active_page_tab()
+        if tab is None:
+            return
+        lang = self.lang
+        title = getattr(tab, "_gem_full_title", "") or "sayfa"
+        safe = "".join(c for c in title if c not in '\\/:*?"<>|').strip() or "sayfa"
+        default_path = os.path.join(os.path.expanduser("~"), f"{safe}.pdf")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "PDF Olarak Kaydet" if lang == "tr" else "Save as PDF",
+            default_path, "PDF (*.pdf)")
+        if not path:
+            return
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+        tab.web_page.printToPdf(path)
+        show_modern_info(
+            self,
+            "PDF kaydedildi: " + path if lang == "tr" else "PDF saved: " + path,
+            lang=lang)
+
+    def _save_page(self):
+        tab = self._active_page_tab()
+        if tab is not None and tab.web_page is not None:
+            tab.web_page.triggerAction(QWebEnginePage.WebAction.SavePage)
+
+    def _view_source(self):
+        import base64 as _b64
+        tab = self._active_page_tab()
+        if tab is None or tab.web_page is None:
+            return
+
+        def _show(html):
+            if html is None:
+                return
+            data = "data:text/html;charset=utf-8;base64," + _b64.b64encode(
+                html.encode("utf-8", errors="replace")).decode("ascii")
+            self.add_new_tab(QUrl(data))
+
+        tab.web_page.toHtml(_show)
+
+    def _duplicate_tab(self, tab=None):
+        tab = tab or self.current_tab()
+        if not isinstance(tab, BrowserTab):
+            return
+        if tab.is_suspended:
+            url = QUrl(getattr(tab, "saved_url", QUrl("")))
+        elif tab.view is not None:
+            url = tab.view.url()
+        else:
+            return
+        if not url.toString() or _is_gem_internal_page(url.toString()):
+            return
+        self.add_new_tab(QUrl(url))
+
+    def _toggle_tab_mute(self, tab=None):
+        tab = tab or self.current_tab()
+        if isinstance(tab, BrowserTab):
+            tab.set_muted(not tab.is_muted())
+
+    def _update_tab_audio(self, tab, muted: bool, audible: bool):
+        """Ses durumuna göre sekme ikonu: susturulmuş → çizgili hoparlör,
+        ses çıkarıyor → hoparlör, değilse normal favicon."""
+        index = self.tab_widget.indexOf(tab)
+        if index == -1:
+            return
+        accent = gem_theme.get_accent_color(self.settings.current)
+        if muted:
+            icon = gem_icons.get_icon("volume-off", "#e67e22", size=16)
+        elif audible:
+            icon = gem_icons.get_icon("volume", accent, size=16)
+        else:
+            base = getattr(tab, "_gem_base_icon", None)
+            icon = base if base is not None else self._app_icon()
+        self.tab_widget.setTabIcon(index, icon)
+        # Sidebar satırının ikonunu yerinde güncelle (ses durumu anında
+        # yansısın; context menü etiketi de tab._muted'dan okur)
+        row = self._sidebar_rows.get(tab)
+        if row is not None:
+            try:
+                row.set_icon(icon)
+            except RuntimeError:
+                self._sidebar_rows.pop(tab, None)
+
+    def _tab_search(self):
+        dlg = TabSearchDialog(self)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.exec()
+
+    def _open_clear_data(self):
+        dlg = ClearDataDialog(self.settings, self)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        sel = dlg.get_selection()
+        self.settings.current["clear_data_on_exit"] = sel["on_exit"]
+        self.settings.save()
+
+        if sel["cookies"]:
+            self.shared_profile.cookieStore().deleteAllCookies()
+        if sel["cache"]:
+            try:
+                self.shared_profile.clearHttpCache()
+            except AttributeError:
+                pass  # eski Qt: profil seviyesinde önbellek temizleme yok
+        if sel["history"] and not self.is_incognito:
+            import time as _time
+            hours = sel["history_hours"] or 0
+            cutoff = (_time.time() - hours * 3600) if hours else 0
+            if cutoff:
+                self.persistent_history = [e for e in self.persistent_history
+                                           if e.get("timestamp", 0) >= cutoff]
+            else:
+                self.persistent_history = []
+            gem_history.save_history(self.persistent_history)
+            self.session_history = [e.get("url", "") for e in self.persistent_history][-500:]
+        if sel["downloads"]:
+            dm = self.download_manager
+            dm.history = []
+            dm._save_history()
+            dm.history_changed.emit()
+        show_modern_info(
+            self,
+            "Seçili tarama verileri temizlendi." if self.lang == "tr"
+            else "Selected browsing data cleared.",
+            lang=self.lang)
+
+    def _focus_url_bar(self):
+        self._hide_suggestions()
+        self.url_bar.setFocus()
+        self.url_bar.selectAll()
+
+    def _cycle_tab(self, delta: int):
+        count = self.tab_widget.count()
+        if count <= 1:
+            return
+        idx = (self.tab_widget.currentIndex() + delta) % count
+        self.tab_widget.setCurrentIndex(idx)
+
+    def _goto_tab_number(self, number: int):
+        """Ctrl+1..8 -> o sıradaki sekme; Ctrl+9 -> SON sekme (Chrome gibi)."""
+        count = self.tab_widget.count()
+        if count == 0:
+            return
+        index = count - 1 if number == 9 else number - 1
+        if 0 <= index < count:
+            self.tab_widget.setCurrentIndex(index)
+
+    def _flush_history(self):
+        if getattr(self, "_history_dirty", False):
+            self._history_dirty = False
+            gem_history.save_history(self.persistent_history)
 
     def _record_history(self, tab: BrowserTab):
         if self.is_incognito or tab.is_suspended or tab.view is None: return
         url_str = tab.view.url().toString()
-        if not url_str or tab.view.url().scheme() not in ("http", "https") or (url_str.startswith("file://") and "gem_browser_new_tab" in url_str): return
-        self.persistent_history = gem_history.add_entry(self.persistent_history, url_str, tab.view.title() or url_str)
+        if not url_str or tab.view.url().scheme() not in ("http", "https") or (_is_gem_internal_page(url_str)): return
+        self.persistent_history = gem_history.add_entry(
+            self.persistent_history, url_str, tab.view.title() or url_str, save=False)
         if not self.session_history or self.session_history[-1] != url_str:
             self.session_history.append(url_str)
             if len(self.session_history) > 500: self.session_history = self.session_history[-500:]
+        # Diske yazımı geciktir: her sayfa yüklemesinde tüm geçmiş dosyasını
+        # yazmak yerine 3 sn'de bir (ve kapanışta) yaz.
+        self._history_dirty = True
+        if not hasattr(self, "_history_flush_timer"):
+            self._history_flush_timer = QTimer(self)
+            self._history_flush_timer.setSingleShot(True)
+            self._history_flush_timer.setInterval(3000)
+            self._history_flush_timer.timeout.connect(self._flush_history)
+        if not self._history_flush_timer.isActive():
+            self._history_flush_timer.start()
 
     def current_tab(self) -> BrowserTab: return self.tab_widget.currentWidget()
     def _navigate_back(self): tab = self.current_tab(); (tab.view.back() if tab and not tab.is_suspended else None)
     def _navigate_forward(self): tab = self.current_tab(); (tab.view.forward() if tab and not tab.is_suspended else None)
     def _reload_page(self): tab = self.current_tab(); (tab.view.reload() if tab and not tab.is_suspended else None)
-    
+
     def _set_url_bar_text(self, text: str) -> None:
         self.url_bar.setText(text)
         self.url_bar.setCursorPosition(0)
@@ -2055,10 +2533,45 @@ class MainWindow(QMainWindow):
             tab = self.current_tab()
             if tab:
                 if tab.is_suspended: tab.restore()
-                tab.view.setUrl(resolve_url(input_text))
+                self._enforce_max_live_tabs()
+                tab.view.setUrl(resolve_url(
+                    input_text,
+                    engine=self.settings.current.get("search_engine", "brave"),
+                    custom_url=self.settings.current.get("custom_search_url", ""),
+                ))
 
     def closeEvent(self, event):
         self.vault_lock_timer.stop()
+        # Pencere durumunu kaydet (minimize durumundaysa son bilinen boyut).
+        s = self.settings.current
+        if self.windowState() & Qt.WindowState.WindowMinimized:
+            pass  # minimize edilmişse mevcut değerleri koru
+        elif self.windowState() & Qt.WindowState.WindowMaximized:
+            s["win_maximized"] = True
+        else:
+            s["win_maximized"] = False
+            s["win_x"] = self.x(); s["win_y"] = self.y()
+            s["win_w"] = self.width(); s["win_h"] = self.height()
+        self.settings.save()
+        # Calisan PDF indirme thread'leri varsa kapanmadan bekle — aksi halde
+        # "QThread: Destroyed while thread is still running" ile cokebilir.
+        for t in list(getattr(self, "_pdf_fetch_threads", [])):
+            if t.isRunning():
+                t.wait(10000)
+        # Açık geliştirici araçlarını kapat (sayfalar yok edilmeden).
+        for i in range(self.tab_widget.count()):
+            t = self.tab_widget.widget(i)
+            if isinstance(t, BrowserTab):
+                t.close_devtools()
+        # Bekleyen geçmiş yazımını diske boşalt.
+        self._flush_history()
+        # "Kapanışta temizle" ayarı işaretliyse çerezler + önbellek.
+        if self.settings.current.get("clear_data_on_exit", False):
+            self.shared_profile.cookieStore().deleteAllCookies()
+            try:
+                self.shared_profile.clearHttpCache()
+            except AttributeError:
+                pass
         if getattr(self, "tor_vpn", None) is not None and self.tor_vpn.is_active:
             self.tor_vpn.disconnect()
         if self._blocklist_thread is not None and self._blocklist_thread.isRunning():
@@ -2067,12 +2580,32 @@ class MainWindow(QMainWindow):
                 self._blocklist_thread.finished_err.disconnect()
             except TypeError: pass
             if not [w for w in _active_windows if w is not self]: self._blocklist_thread.wait(3000)
-        
+
+        # İndirme sinyali sahipliğini, aynı profili kullanan başka bir
+        # pencere varsa devret — aksi halde bu pencere kapanınca indirmeler
+        # artık hiç diyaloğa bağlanmaz.
+        if getattr(self, "_owns_download_signal", False):
+            self._owns_download_signal = False
+            try:
+                self.shared_profile.downloadRequested.disconnect(self.download_manager.handle_download)
+            except TypeError:
+                pass
+            if self.shared_profile in _download_connected_profiles:
+                _download_connected_profiles.remove(self.shared_profile)
+            successor = next(
+                (w for w in _active_windows if w is not self and w.shared_profile is self.shared_profile),
+                None,
+            )
+            if successor is not None:
+                _download_connected_profiles.append(self.shared_profile)
+                successor._owns_download_signal = True
+                self.shared_profile.downloadRequested.connect(successor.download_manager.handle_download)
+
         if self.is_incognito: self.shared_profile.cookieStore().deleteAllCookies()
         else:
             if not [w for w in _active_windows if w is not self]:
                 tab_urls = self._collect_session_tab_urls()
                 gem_session.save_session(tab_urls) if tab_urls else gem_session.clear_session()
-        
+
         if self in _active_windows: _active_windows.remove(self)
         event.accept()

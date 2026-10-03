@@ -27,7 +27,15 @@ gerçekten çalışan ve sürdürülebilir, dürüst bir "ücretsiz VPN" sağlar
 Sınırlama: Tor, ticari bir VPN kadar hızlı değildir (birden çok röle
 üzerinden yönlendirme yaptığı için gecikme daha yüksektir) ama gerçek,
 canlı ve güvenilir bir ağdır — rastgele ölü/aşırı yüklü public proxy'lerin
-tam tersi. Kullanıcı isterse (Ayarlar'da host/port doldurarak) kendi
+tam tersi.
+
+DÜRÜST ANONİMLİK NOTU: Bu entegrasyon Tor Browser kadar anonim DEĞİLDİR —
+tor daemon'ı üzerinden giden trafiğin kendisi Tor ağıdır, ama tarayıcı
+parmak izi, WebRTC/DNS kenar durumları ve davranışsal izleme korunmaz.
+(VPN açıkken WebRTC IP sızıntısı uygulama tarafında engellenir; bkz.
+main.py --force-webrtc-ip-handling-policy ve window.py'deki
+WebRTCPublicInterfacesOnly.) Yüksek riskli kullanım için resmi
+Tor Browser tercih edilmelidir. Kullanıcı isterse (Ayarlar'da host/port doldurarak) kendi
 ücretli VPN sağlayıcısının SOCKS5 adresini de girebilir; bu durumda bu
 modül hiç devreye girmez (bkz. window.py:_apply_vpn).
 """
@@ -75,16 +83,29 @@ class _TorWorker(QObject):
 
     def start(self):
         try:
+            # Rastgele boş bir yerel SOCKS5 portu; window.py, connected
+            # sinyaliyle bu portu QNetworkProxy'ye uyguladığı için portun
+            # önceden bilinmesi gerekmez.
             socks_port = _free_tcp_port()
             self._data_dir = tempfile.mkdtemp(prefix="gem_tor_")
 
+            # ÖNEMLİ: Tor varsayılan olarak /etc/tor/torrc'yi okur; dağıtım
+            # torrc'lerindeki "User tor" satırı, root OLMAYAN bir kullanıcı
+            # olarak çalıştırıldığında "Failed to parse/validate config"
+            # hatasıyla (çıkış kodu 1) anında ölmesine yol açıyordu. Kendi
+            # BOŞ konfigürasyon dosyamızı vererek sistem torrc'sini tamamen
+            # bypass ediyoruz.
+            torrc_path = os.path.join(self._data_dir, "torrc")
+            with open(torrc_path, "w", encoding="utf-8") as f:
+                f.write("")
+
             cmd = [
                 self.tor_path,
+                "-f", torrc_path,
                 "--SocksPort", str(socks_port),
                 "--DataDirectory", self._data_dir,
                 "--ControlPort", "0",
                 "--Log", "notice stdout",
-                "--ClientOnly", "1",
             ]
             popen_kwargs = {}
             if sys.platform.startswith("win"):
@@ -100,9 +121,12 @@ class _TorWorker(QObject):
             )
         except Exception as exc:
             self.failed.emit(f"Tor başlatılamadı: {exc}")
+            self._cleanup_process()
+            self.stopped.emit()
             return
 
         already_connected = False
+        last_warning = ""
         try:
             for line in self._process.stdout:
                 if self._stop_requested:
@@ -119,33 +143,57 @@ class _TorWorker(QObject):
                     if pct >= 100 and not already_connected:
                         already_connected = True
                         self.connected.emit(socks_port)
+                elif "[warn]" in line.lower() or "[err]" in line.lower():
+                    # Kullanıcıya gösterilecek en güncel Tor uyarısı/hatası
+                    # (zaman damgası kısmı atılır).
+                    tail = line.split("] ", 1)[-1]
+                    last_warning = tail[:160]
         finally:
-            pass
+            self._cleanup_process()
 
         if not self._stop_requested:
-            code = self._process.poll()
+            code = self._process.poll() if self._process else None
             if not already_connected:
                 detail = f" (çıkış kodu: {code})" if code not in (None, 0) else ""
-                self.failed.emit(f"Tor devresi kurulamadı{detail}.")
+                if last_warning:
+                    self.failed.emit(f"Tor devresi kurulamadı{detail}. Tor: {last_warning}")
+                else:
+                    self.failed.emit(f"Tor devresi kurulamadı{detail}.")
             elif code not in (None, 0):
                 # Bağlıyken süreç beklenmedik şekilde kapandı.
                 self.failed.emit(f"Tor beklenmedik şekilde kapandı (kod {code}).")
 
         self.stopped.emit()
 
+    def _cleanup_process(self):
+        """Sürecin tam olarak kapanmasını bekle ve geçici veri dizinini
+        sil. Bilinçli olarak yalnızca İŞÇİ THREAD'inden çağrılır —
+        beklemeler (wait/kill) UI thread'ini bloklamasın."""
+        if self._process is not None:
+            if self._process.poll() is None:
+                try:
+                    self._process.terminate()
+                    self._process.wait(timeout=5)
+                except Exception:
+                    try:
+                        self._process.kill()
+                        self._process.wait(timeout=3)
+                    except Exception:
+                        pass
+        if self._data_dir and os.path.isdir(self._data_dir):
+            shutil.rmtree(self._data_dir, ignore_errors=True)
+            self._data_dir = None
+
     def stop(self):
+        # UI thread'inden çağrılabilir; hızlı geri döner. Sürecin
+        # kapanmasını bekleme/rmtree işi, stdout okuma döngüsü sona erdikten
+        # sonra _cleanup_process() tarafından işçi thread'inde yapılır.
         self._stop_requested = True
         if self._process and self._process.poll() is None:
             try:
                 self._process.terminate()
-                self._process.wait(timeout=5)
             except Exception:
-                try:
-                    self._process.kill()
-                except Exception:
-                    pass
-        if self._data_dir and os.path.isdir(self._data_dir):
-            shutil.rmtree(self._data_dir, ignore_errors=True)
+                pass
 
 
 class TorVpnManager(QObject):
@@ -164,6 +212,9 @@ class TorVpnManager(QObject):
         super().__init__(parent)
         self._thread = None
         self._worker = None
+        # disconnect() sırasında hâlâ kapanmakta olan thread'ler: Python
+        # referansı düşerse C++ tarafı çalışırken silinip çökmesin.
+        self._dying_threads = []
         self.socks_port = None
         self.is_connected = False
         self._connecting = False
@@ -177,7 +228,7 @@ class TorVpnManager(QObject):
         return self._thread is not None or self.is_connected
 
     def connect(self):
-        if self._thread is not None or self.is_connected:
+        if self._connecting or self.is_connected or self._thread is not None:
             return  # zaten bağlanıyor ya da bağlı
 
         tor_path = find_tor_binary()
@@ -199,9 +250,22 @@ class TorVpnManager(QObject):
         self._worker.connected.connect(self._on_connected)
         self._worker.failed.connect(self._on_failed)
         self._worker.stopped.connect(self._thread.quit)
+        # Thread bittiğinde referansları temizle: aksi halde başarısız bir
+        # denemeden sonra _thread dolu kalır ve connect() sonsuza dek "zaten
+        # bağlı" sanıp erken dönerdi — kullanıcı VPN'i yeniden açamazdı.
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.finished.connect(self._on_worker_thread_finished)
 
         self.status_changed.emit("connecting", 0)
         self._thread.start()
+
+    def _on_worker_thread_finished(self):
+        sender = self.sender()
+        if isinstance(sender, QThread) and sender in self._dying_threads:
+            self._dying_threads.remove(sender)
+        if sender is self._thread:
+            self._thread = None
+            self._worker = None
 
     def _on_progress(self, pct):
         if self._connecting:
@@ -221,11 +285,16 @@ class TorVpnManager(QObject):
         self.status_changed.emit("error", 0)
 
     def disconnect(self):
-        if self._worker:
-            self._worker.stop()
-        if self._thread:
-            self._thread.quit()
-            self._thread.wait(3000)
+        worker = self._worker
+        thread = self._thread
+        if worker:
+            worker.stop()  # artık bloklamayan çağrı; beklemeyi işçi yapar
+        if thread:
+            thread.quit()
+            if not thread.wait(3000):
+                # Hâlâ kapanmadıysa referansı tut; bittiğinde kendini
+                # temizler (bkz. _on_worker_thread_finished).
+                self._dying_threads.append(thread)
         self._thread = None
         self._worker = None
         self.socks_port = None

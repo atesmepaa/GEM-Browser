@@ -135,6 +135,25 @@ _ICONS = {
         '<line x1="2" y1="12" x2="22" y2="12"/>'
         '<path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>'
     ) + _TAIL,
+    "volume": _STROKE_HEAD + (
+        '<polygon points="11 5 6 9 3 9 3 15 6 15 11 19 11 5"/>'
+        '<path d="M15.5 8.5a5 5 0 0 1 0 7"/>'
+        '<path d="M18.5 5.5a9 9 0 0 1 0 13"/>'
+    ) + _TAIL,
+    "volume-off": _STROKE_HEAD + (
+        '<polygon points="11 5 6 9 3 9 3 15 6 15 11 19 11 5"/>'
+        '<line x1="23" y1="9" x2="17" y2="15"/>'
+        '<line x1="17" y1="9" x2="23" y2="15"/>'
+    ) + _TAIL,
+    "camera": _STROKE_HEAD + (
+        '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>'
+        '<circle cx="12" cy="13" r="4"/>'
+    ) + _TAIL,
+    "printer": _STROKE_HEAD + (
+        '<polyline points="6 9 6 2 18 2 18 9"/>'
+        '<path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/>'
+        '<rect x="6" y="14" width="12" height="8"/>'
+    ) + _TAIL,
 }
 
 _pixmap_cache = {}
@@ -259,6 +278,33 @@ def tinted_logo_file(color: str, size: int = 128) -> str:
 
     safe_color = (color or "").lstrip("#").lower() or "default"
     file_path = config_path(f"gem_logo_tinted_{safe_color}_{size}.png")
-    if not os.path.exists(file_path):
-        pixmap.save(file_path, "PNG")
+
+    # Don't trust mere existence: a previous run may have crashed or been
+    # interrupted mid-write and left a 0-byte / truncated PNG behind. Treat
+    # a missing OR empty/invalid file as "needs (re)generating".
+    needs_write = True
+    if os.path.exists(file_path):
+        try:
+            needs_write = os.path.getsize(file_path) == 0
+        except OSError:
+            needs_write = True
+
+    if needs_write:
+        # Write atomically: save to a temp file in the same directory, then
+        # rename over the destination. This avoids ever leaving a half
+        # written/corrupt PNG at file_path if the process is interrupted
+        # mid-save (rename is atomic on the same filesystem).
+        tmp_path = f"{file_path}.tmp{os.getpid()}"
+        if pixmap.save(tmp_path, "PNG") and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+            os.replace(tmp_path, file_path)
+        else:
+            # Save failed outright; clean up any partial temp file and
+            # don't leave a bad file behind for next time to misdetect.
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            return ""
+
     return file_path

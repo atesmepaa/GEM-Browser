@@ -1,36 +1,40 @@
 """
-Siteler kamera, mikrofon, konum, bildirim gibi izin istediğinde beliren,
-kullanıcı karar verene kadar duran küçük onay kartı.
+Site izin istekleri (kamera, mikrofon, konum, bildirim...) için Chrome
+tarzı kompakt flyout kart.
 
-Konumlandırma: artık pencerenin sol üst köşesine değil, sekme barının
-hemen ALTINA, sol kenara hizalı olarak açılıyor — böylece toolbar/sekme
-barının üzerini kapatmıyor ve hangi sekmeyle ilgili olduğu daha açık
-oluyor (indirme bildirimlerinin sağ üstte çıkmasıyla simetrik bir
-karşı köşe yerine, artık tarayıcının "içerik" alanının hemen başına
-oturuyor).
+MİMARİ NOT: Bu kart bir QDialog DEĞİL, ana pencerenin içine yerleşen bir
+child overlay widget'tır. Neden: Wayland'da (KDE/GNOME varsayılı) uygulamalar
+kendi top-level pencerelerini EKRAN ÜZERİNDE KONUMLANDIRAMAZ — QDialog
+yaklaşımı pencere yöneticisi tarafından ortalanıyordu. Child overlay ise
+ana pencere koordinatlarında piksel piksel yerleştirilir; X11/Wayland
+farkı gözetmez.
+
+Konum: adres çubuğunun hemen altı, sol kilit simgesinin hizası (Chrome
+izin baloncuğu gibi). Dikey modda sekme çubuğu gizliyken pencere köşesine
+düşer. Birden çok istek stack_index ile aşağı yığınlanır.
+
+Davranış: NON-MODAL ve bloklamaz — kart yalnızca kendi dikdörtgeni
+üzerindeki tıklamaları alır; sayfada gezinme/tıklama/yazma kesilmez.
+Sekme başka bir origin'e gezinirse bekleyen kartlar otomatik reddedilir
+(bkz. browser_tab._dismiss_stale_permission_popups).
 """
 
 from PyQt6.QtWidgets import (
-    QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QApplication, QGraphicsDropShadowEffect
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QGraphicsDropShadowEffect
 )
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QFontMetrics
 from PyQt6.QtWebEngineCore import QWebEnginePage
 
 from gem_browser import theme as gem_theme
 
-POPUP_MARGIN = 16
-POPUP_SPACING = 10
-
-# URL çubuğuyla (bkz. window.py QLineEdit stili) aynı yazı ailesi, tutarlı
-# bir görünüm için burada da kullanılıyor.
-UI_FONT_FAMILY = "'Segoe UI', 'Ubuntu', sans-serif"
+UI_FONT_FAMILY = "Segoe UI"
 
 _FEATURE_LABELS = {
     QWebEnginePage.Feature.Geolocation: {
-        "tr": "konumunuza erişmek istiyor",
-        "en": "wants to access your location",
+        "tr": "konumunuzu kullanmak istiyor",
+        "en": "wants to use your location",
     },
     QWebEnginePage.Feature.MediaAudioCapture: {
         "tr": "mikrofonunuzu kullanmak istiyor",
@@ -45,8 +49,8 @@ _FEATURE_LABELS = {
         "en": "wants to use your camera and microphone",
     },
     QWebEnginePage.Feature.Notifications: {
-        "tr": "size bildirim göndermek istiyor",
-        "en": "wants to send you notifications",
+        "tr": "bildirim göndermek istiyor",
+        "en": "wants to send notifications",
     },
     QWebEnginePage.Feature.MouseLock: {
         "tr": "fare imlecinizi kilitlemek istiyor",
@@ -62,8 +66,6 @@ _FEATURE_LABELS = {
     },
 }
 
-# Her özellik için küçük bir rozet ikonu — kartı taramak (scan) kolaylaşsın
-# diye salt metnin önüne görsel bir ipucu ekliyor.
 _FEATURE_ICONS = {
     QWebEnginePage.Feature.Geolocation: "📍",
     QWebEnginePage.Feature.MediaAudioCapture: "🎤",
@@ -87,135 +89,140 @@ def feature_icon(feature) -> str:
     return _FEATURE_ICONS.get(feature, "🔒")
 
 
-class _CardContainer(QWidget):
-    """Gerçek kartın çizildiği iç widget. Dış QDialog şeffaf tutulup
-    (WA_TranslucentBackground) yuvarlak köşelerin dışına taşan piksel
-    olmaması için tüm görsel stil bu iç widget üzerinde uygulanıyor."""
+class PermissionPopup(QWidget):
+    """Tek bir izin isteğini gösteren, Chrome tarzı kompakt flyout.
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setObjectName("permCard")
-
-
-class PermissionPopup(QDialog):
+    Child overlay olarak çalışır; completed(bool) sinyali kullanıcının
+    kararını bildirir (True = İzin Ver). dismiss() dışarıdan reddetmek
+    için kullanılır (gezinti, suspend, temizlik akışları).
     """
-    Reddet/İzin Ver butonlarıyla tek bir izin isteğini gösterir. Modal
-    DEĞİLDİR — kullanıcı sayfayla etkileşime devam edebilirken karar
-    verene kadar ekranda kalır. Sonuç `finished` sinyali (Accepted/Rejected)
-    üzerinden okunur.
-    """
+
+    completed = pyqtSignal(bool)  # granted
 
     def __init__(self, origin_host: str, feature, lang: str = "tr", parent=None, accent: str = None):
         super().__init__(parent)
-        self.lang = lang
+        self.origin_host = origin_host or ""
         self.feature = feature
+        self.lang = lang
+
+        # Child overlay: sayfanın ÜZERİNDE çizilmesi için saydam arka plan
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
         accent = accent or gem_theme.DEFAULT_ACCENT_DARK
         accent_hover = gem_theme.lighten(accent)
         accent_text = gem_theme.readable_text_color(accent)
 
-        self.setWindowFlags(
-            Qt.WindowType.Tool
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.FramelessWindowHint
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedWidth(340)
+        icon_char = feature_icon(feature)
+        label_text = feature_label(feature, lang)
+        host = self.origin_host or ("bu site" if lang == "tr" else "this site")
 
-        outer_layout = QVBoxLayout(self)
-        outer_layout.setContentsMargins(0, 0, 0, 0)
+        # --- dinamik genişlik: içeriğe sığar, üst sınır 380px ---
+        origin_font = QFont(UI_FONT_FAMILY, 10)
+        origin_font.setBold(True)
+        origin_w = QFontMetrics(origin_font).horizontalAdvance(host)
+        self.setFixedWidth(max(260, min(origin_w + 34 + 24, 380)))
 
-        self._card_widget = _CardContainer(self)
-        outer_layout.addWidget(self._card_widget)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
 
-        self._card_widget.setStyleSheet(
-            "QWidget#permCard { background-color: #242424; border: 1px solid rgba(255, 255, 255, 0.08); "
-            "border-radius: 14px; } "
-            f"QLabel {{ background: transparent; color: #ffffff; font-family: {UI_FONT_FAMILY}; font-size: 13px; }} "
-            "QLabel#permHost { font-weight: 600; } "
-            "QLabel#permIcon { font-size: 22px; } "
+        card = QWidget(self)
+        card.setObjectName("permCard")
+        root.addWidget(card)
+        card.setStyleSheet(
+            "QWidget#permCard { background-color: #242424; border: 1px solid rgba(255, 255, 255, 0.10); "
+            "border-radius: 12px; } "
+            f"QLabel {{ background: transparent; color: #ffffff; font-family: '{UI_FONT_FAMILY}'; }}"
+            "QLabel#permHost { font-size: 12px; font-weight: 600; } "
+            "QLabel#permDesc { font-size: 12px; color: #b8b8c0; } "
+            "QLabel#permIcon { font-size: 16px; background: transparent; } "
             "QPushButton { background-color: transparent; color: #b0b0b0; border: 1px solid rgba(255, 255, 255, 0.12); "
-            f"font-family: {UI_FONT_FAMILY}; font-size: 13px; font-weight: 500; "
-            "padding: 7px 16px; border-radius: 16px; } "
+            f"font-family: '{UI_FONT_FAMILY}'; font-size: 12px; font-weight: 500; "
+            "padding: 5px 14px; border-radius: 14px; } "
             "QPushButton:hover { background-color: rgba(255, 255, 255, 0.06); color: #ffffff; } "
             "QPushButton#allowBtn { background-color: " + accent + "; color: " + accent_text + "; border: 1px solid " + accent + "; } "
             "QPushButton#allowBtn:hover { background-color: " + accent_hover + "; border: 1px solid " + accent_hover + "; }"
         )
 
-        content = QVBoxLayout(self._card_widget)
-        content.setContentsMargins(16, 14, 16, 14)
-        content.setSpacing(12)
+        content = QVBoxLayout(card)
+        content.setContentsMargins(12, 10, 12, 10)
+        content.setSpacing(6)
 
         top_row = QHBoxLayout()
-        top_row.setSpacing(12)
-
-        icon_lbl = QLabel(feature_icon(feature))
+        top_row.setSpacing(8)
+        icon_lbl = QLabel(icon_char)
         icon_lbl.setObjectName("permIcon")
-        icon_lbl.setFixedWidth(28)
+        icon_lbl.setFixedSize(20, 20)
         icon_lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
         top_row.addWidget(icon_lbl)
 
-        host = origin_host or ("bu site" if lang == "tr" else "this site")
         text_col = QVBoxLayout()
         text_col.setSpacing(2)
         host_lbl = QLabel(host)
         host_lbl.setObjectName("permHost")
         host_lbl.setWordWrap(True)
-        desc_lbl = QLabel(feature_label(feature, lang))
+        desc_lbl = QLabel(label_text)
+        desc_lbl.setObjectName("permDesc")
         desc_lbl.setWordWrap(True)
         text_col.addWidget(host_lbl)
         text_col.addWidget(desc_lbl)
         top_row.addLayout(text_col, 1)
-
         content.addLayout(top_row)
 
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
+        btn_row.setSpacing(6)
         btn_row.addStretch()
-        self.deny_btn = QPushButton("Reddet" if lang == "tr" else "Deny")
-        self.allow_btn = QPushButton("İzin Ver" if lang == "tr" else "Allow")
-        self.allow_btn.setObjectName("allowBtn")
-        self.deny_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.allow_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_row.addWidget(self.deny_btn)
-        btn_row.addWidget(self.allow_btn)
+        deny_btn = QPushButton("Reddet" if lang == "tr" else "Deny")
+        allow_btn = QPushButton("İzin Ver" if lang == "tr" else "Allow")
+        allow_btn.setObjectName("allowBtn")
+        deny_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        allow_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_row.addWidget(deny_btn)
+        btn_row.addWidget(allow_btn)
         content.addLayout(btn_row)
 
-        self.deny_btn.clicked.connect(self.reject)
-        self.allow_btn.clicked.connect(self.accept)
-
-        shadow = QGraphicsDropShadowEffect(self._card_widget)
-        shadow.setBlurRadius(28)
+        shadow = QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(24)
         shadow.setXOffset(0)
-        shadow.setYOffset(6)
-        shadow.setColor(QColor(0, 0, 0, 140))
-        self._card_widget.setGraphicsEffect(shadow)
+        shadow.setYOffset(4)
+        shadow.setColor(QColor(0, 0, 0, 120))
+        card.setGraphicsEffect(shadow)
 
-    def position_below_tab_bar(self, anchor_widget=None, stack_index: int = 0):
-        """
-        Popup'ı verilen `anchor_widget`'ın (tipik olarak sekme barının)
-        SOL ALT köşesinin hemen altına, sol kenara hizalı şekilde konumlar.
-        `anchor_widget` verilmez/görünür değilse ekranın sol üstüne düşer.
-        """
+        self.deny_btn = deny_btn
+        self.allow_btn = allow_btn
+        deny_btn.clicked.connect(self.reject)
+        allow_btn.clicked.connect(self.accept)
+
+    def position_at_url_bar(self, anchor_widget, stack_index: int = 0):
+        """Adres çubuğunun hemen altına, sol kilit simgesinin altına
+        hizalar. Child overlay olduğu için konum ANA PENCERE
+        koordinatlarındadır — Wayland dahil her yerde birebir çalışır."""
         self.adjustSize()
-        if anchor_widget is not None and anchor_widget.isVisible():
-            bottom_left = anchor_widget.mapToGlobal(anchor_widget.rect().bottomLeft())
-            x = bottom_left.x() + POPUP_MARGIN
-            y = bottom_left.y() + POPUP_SPACING + stack_index * (self.height() + POPUP_SPACING)
+        parent = self.parentWidget()
+        if anchor_widget is not None and parent is not None:
+            tl = anchor_widget.mapTo(parent, anchor_widget.rect().topLeft())
+            bl = anchor_widget.mapTo(parent, anchor_widget.rect().bottomLeft())
+            x = tl.x() + 34  # adres çubuğunun sol simgesinin altı
+            y = bl.y() + 6 + stack_index * (self.height() + 8)
         else:
-            screen = QApplication.primaryScreen().availableGeometry()
-            x = screen.x() + POPUP_MARGIN
-            y = screen.y() + POPUP_MARGIN + stack_index * (self.height() + POPUP_SPACING)
+            x, y = 40, 96
         self.move(x, y)
 
-    # Geriye dönük uyumluluk: eski isimle çağrılırsa da artık sekme barının
-    # altına hizalar (eski davranış pencere köşesine hizalıyordu). `parent`
-    # bir MainWindow ise `tab_widget.tabBar()` otomatik bulunur.
-    def position_top_left(self, parent=None, stack_index: int = 0):
-        anchor = None
-        if parent is not None:
-            tab_widget = getattr(parent, "tab_widget", None)
-            if tab_widget is not None:
-                anchor = tab_widget.tabBar()
-        self.position_below_tab_bar(anchor, stack_index=stack_index)
+    def show_at(self, anchor_widget, stack_index: int = 0):
+        """Konumlandır + göster + sayfa içeriğinin üstüne taşı."""
+        self.position_at_url_bar(anchor_widget, stack_index)
+        self.show()
+        self.raise_()
+
+    def accept(self):
+        self.completed.emit(True)
+        self.hide()
+        self.deleteLater()
+
+    def reject(self):
+        self.completed.emit(False)
+        self.hide()
+        self.deleteLater()
+
+    def dismiss(self):
+        """Dışarıdan reddetme (gezinti, suspend, sekme kapanışı)."""
+        self.reject()

@@ -88,11 +88,18 @@ class DownloadsDialog(QDialog):
                 files = []
                 for f in os.listdir(downloads_path):
                     full_path = os.path.join(downloads_path, f)
-                    if os.path.isfile(full_path):
-                        files.append((full_path, f, os.path.getmtime(full_path)))
+                    try:
+                        if not os.path.isfile(full_path):
+                            continue
+                        #Dosya silinirken/kilitliyken stat çağrısı OSError
+                        # fırlatabilir; o dosyayı sessizce atla.
+                        mtime = os.path.getmtime(full_path)
+                        size_mb = os.path.getsize(full_path) / (1024 * 1024)
+                    except OSError:
+                        continue
+                    files.append((full_path, f, mtime, size_mb))
                 files.sort(key=lambda x: x[2], reverse=True)
-                for full_p, f, _ in files[:50]:
-                    size_mb = os.path.getsize(full_p) / (1024 * 1024)
+                for full_p, f, _, size_mb in files[:50]:
                     item = QListWidgetItem(f"{f}  ({size_mb:.1f} MB)")
                     item.setData(Qt.ItemDataRole.UserRole, full_p)
                     self.list_widget.addItem(item)

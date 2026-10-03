@@ -13,6 +13,7 @@ import json
 import os
 import ssl
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -52,6 +53,12 @@ _SKIP_HOSTS = {
     "ip6-localhost", "ip6-loopback", "ip6-localnet", "ip6-mcastprefix",
     "ip6-allnodes", "ip6-allrouters", "ip6-allhosts", "0.0.0.0",
 }
+
+# Güncelleme, aynı anda tek bir thread'de koşsun. İki pencere (veya periyodik
+# kontrol + elle tetikleme) eşzamanlı update_blocklist() çağırırsa ikincisi
+# BlocklistUpdateInProgress fırlatır — eskiden bu istisna hiçbir yerde
+# fırlatılmadığı için __IN_PROGRESS__ koruma dalı erişilemez ölü koddü.
+_update_lock = threading.Lock()
 
 
 def _parse_hosts_text(text: str) -> set:
@@ -98,38 +105,46 @@ def update_blocklist(source_url: str = SOURCE_URL) -> int:
     sessizce ya da bir uyarıyla iletir). Başarılı olursa domain sayısını
     döndürür.
 
+    Bir güncelleme hâlihazırda sürerken çağrılırsa BlocklistUpdateInProgress
+    fırlatılır (modül seviyesindeki _update_lock ile garanti edilir).
+
     Diske yazım atomik yapılır (önce geçici dosyaya, sonra os.replace ile
     taşınır) — böylece güncelleme yarıda kesilirse (uygulama kapanması,
     ağ kopması vb.) önceki geçerli önbellek bozulmaz.
     """
-    text = _download(source_url)
-    domains = _parse_hosts_text(text)
-    if not domains:
-        raise ValueError("İndirilen listeden hiç domain ayrıştırılamadı.")
-
-    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(CACHE_FILE))
+    if not _update_lock.acquire(blocking=False):
+        raise BlocklistUpdateInProgress("Bir güncelleme zaten sürüyor.")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write("\n".join(sorted(domains)))
-        os.replace(tmp_path, CACHE_FILE)
+        text = _download(source_url)
+        domains = _parse_hosts_text(text)
+        if not domains:
+            raise ValueError("İndirilen listeden hiç domain ayrıştırılamadı.")
+
+        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(CACHE_FILE))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(sorted(domains)))
+            os.replace(tmp_path, CACHE_FILE)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        secure_chmod(CACHE_FILE, 0o600)
+
+        meta = {
+            "source": source_url,
+            "domain_count": len(domains),
+            "updated_at": time.time(),
+        }
+        with open(META_FILE, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        secure_chmod(META_FILE, 0o600)
+
+        return len(domains)
     finally:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-    secure_chmod(CACHE_FILE, 0o600)
-
-    meta = {
-        "source": source_url,
-        "domain_count": len(domains),
-        "updated_at": time.time(),
-    }
-    with open(META_FILE, "w", encoding="utf-8") as f:
-        json.dump(meta, f)
-    secure_chmod(META_FILE, 0o600)
-
-    return len(domains)
+        _update_lock.release()
 
 
 def load_cached_domains():
